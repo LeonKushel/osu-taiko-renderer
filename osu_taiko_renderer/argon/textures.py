@@ -10,6 +10,12 @@ from PIL import Image, ImageDraw, ImageFilter
 from . import _const as C
 
 _N = 256   # base texture resolution for a normal note
+# Padding factor for the drum-press glow: the drum shape is baked at 1/_GLOW_PAD
+# of the texture so the outward halo has room to fade to ~0 before the edge
+# (lazer's EdgeEffect glow extends beyond the drum). Without it the halo clips
+# at the square texture bounds and reads as a box. The compositor scales the
+# texture up by _GLOW_PAD so the drum itself still renders at the drum size.
+_GLOW_PAD = 1.6
 
 
 def _vgrad(n, top, bot):
@@ -322,6 +328,7 @@ def bake_drum_flash(*, ring: bool, left: bool, n=_N):
     the hard two-semicircle split (matching lazer's drum + the idle split) is
     intentional here."""
     r, c = _radius(n)
+    r = r * _GLOW_PAD          # shrink the shape -> room for the outward halo
     if ring:
         fill = C.RIM_HIT_FILL
         glow_c = C.RIM_HIT_GLOW

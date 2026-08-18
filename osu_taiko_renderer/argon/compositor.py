@@ -8,7 +8,8 @@ from PIL import Image, ImageChops, ImageFilter
 
 from . import _const as C
 from .font import get_font
-from .textures import bake_drum_flash, bake_explosion, bake_note_flash, bake_ring
+from .textures import (bake_drum_flash, bake_explosion, bake_note_flash,
+                       bake_ring, _GLOW_PAD)
 
 _JUDGE_TEXT = {"great": "GREAT", "ok": "OK", "miss": "MISS"}
 _JUDGE_COL = {"great": C.JUDGE_GREAT, "ok": C.JUDGE_OK, "miss": C.JUDGE_MISS}
@@ -252,8 +253,9 @@ class ArgonEffects:
         self._drum_scaled = {}
         for is_rim in (False, True):
             for left in (True, False):
+                _dpad = int(round(dd * _GLOW_PAD))
                 im8 = np.asarray(Image.fromarray(bake_drum_flash(ring=is_rim, left=left))
-                                 .resize((dd, dd), Image.LANCZOS))
+                                 .resize((_dpad, _dpad), Image.LANCZOS))
                 self._drum_scaled[(is_rim, left)] = _prebake_add(im8)
 
     def _judge_tex(self, result, big=False):
