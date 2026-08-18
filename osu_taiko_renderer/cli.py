@@ -68,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--show-hp", action=BA, default=True)
     ap.add_argument("--show-grade", action=BA, default=True)
     ap.add_argument("--show-mods", action=BA, default=True)
+    ap.add_argument("--hud-opacity", type=float, default=1.0,
+                    help="0 = hide the whole engine HUD (score/acc/combo/counters/break overlay); matches std")
     ap.add_argument("--logo", action=BA, default=False,
                     help="show_logo: the R3D 'R' tile splash during the intro, "
                          "fading out as gameplay starts (parity with std/catch)")
@@ -131,6 +133,7 @@ def main(argv: list[str] | None = None) -> int:
         show_hp_bar=args.show_hp,
         show_grade=args.show_grade,
         show_mods=args.show_mods,
+        hud_opacity=args.hud_opacity,
         show_logo=args.logo,
         show_leaderboard=args.leaderboard,
         leaderboard_source=args.leaderboard_source,

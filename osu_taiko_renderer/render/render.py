@@ -523,15 +523,21 @@ def render_core(
     def _emit_gameplay(raw):
         nonlocal last_gameplay
         p_scene, p_exps, p_judges, p_drums = pending.popleft()
-        out = effects.composite(raw, p_exps, p_judges, p_drums)
+        # hud_opacity 0 suppresses the GREAT/OK/MISS judgement-text popups
+        # (p_judges) too — the YT overlay owns judgement display. Hit
+        # explosions (p_exps) + drum flashes (p_drums) stay = gameplay.
+        out = effects.composite(
+            raw, p_exps, p_judges if cfg.hud_opacity > 0.0 else [], p_drums)
         out = flashlight.composite(out, p_scene.time_ms)
-        out = hud.overlay(out, p_scene)
+        if cfg.hud_opacity > 0.0:
+            out = hud.overlay(out, p_scene)
         # lazer z-order: BreakOverlay is a LATER overlay-component child
         # than HUDOverlay (Player.createOverlayComponents) — composited
         # ABOVE every HUD element, both HUD variants. Live accuracy from
         # the sim's running scene value (bound like lazer's bindable).
         # Cheap no-op outside break windows (frame bytes untouched).
-        break_overlay.draw(out, p_scene.time_ms, p_scene.accuracy)
+        if cfg.hud_opacity > 0.0:
+            break_overlay.draw(out, p_scene.time_ms, p_scene.accuracy)
         last_gameplay = out
         writer.push(out)
 

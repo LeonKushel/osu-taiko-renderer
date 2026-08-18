@@ -182,6 +182,10 @@ class RenderConfig:
     bg_dim_breaks: int = 0
     bg_blur: int = 0
     # HUD toggles
+    # hud_opacity: 0.0 hides the ENTIRE engine HUD (score/acc/combo/grade/mods/
+    # pp/hit-counter/key-counter + break overlay) so the field is gameplay-only,
+    # matching std's --hud-opacity 0. (on/off; >0 = full HUD.)
+    hud_opacity: float = 1.0
     show_combo: bool = True
     show_score: bool = True
     show_hp_bar: bool = True
