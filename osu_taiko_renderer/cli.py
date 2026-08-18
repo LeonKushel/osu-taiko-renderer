@@ -68,6 +68,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--show-hp", action=BA, default=True)
     ap.add_argument("--show-grade", action=BA, default=True)
     ap.add_argument("--show-mods", action=BA, default=True)
+    ap.add_argument("--drum-bg-alpha", type=float, default=1.0,
+                    help="input-drum-area bg opacity; <1 softens the hard black box on bright bgs (0.7 = match the lane). 1.0 = lazer-exact")
     ap.add_argument("--hud-opacity", type=float, default=1.0,
                     help="0 = hide the whole engine HUD (score/acc/combo/counters/break overlay); matches std")
     ap.add_argument("--logo", action=BA, default=False,
@@ -134,6 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         show_grade=args.show_grade,
         show_mods=args.show_mods,
         hud_opacity=args.hud_opacity,
+        drum_bg_alpha=args.drum_bg_alpha,
         show_logo=args.logo,
         show_leaderboard=args.leaderboard,
         leaderboard_source=args.leaderboard_source,

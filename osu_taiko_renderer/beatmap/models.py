@@ -186,6 +186,11 @@ class RenderConfig:
     # pp/hit-counter/key-counter + break overlay) so the field is gameplay-only,
     # matching std's --hud-opacity 0. (on/off; >0 = full HUD.)
     hud_opacity: float = 1.0
+    # input-drum-area bg opacity (lazer ArgonPlayfieldBackgroundLeft = solid
+    # black, 1.0). YT vertical panels lower it (~0.7 = match the note lane) so
+    # the drum area is a soft dim strip over the bg, not a hard black box on a
+    # bright beatmap bg. 1.0 = byte-for-byte lazer (prod default).
+    drum_bg_alpha: float = 1.0
     show_combo: bool = True
     show_score: bool = True
     show_hp_bar: bool = True

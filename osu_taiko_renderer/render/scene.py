@@ -1365,8 +1365,9 @@ class TaikoSim:
             sp.append(Sprite(w / 2, cy, w, g.pf_h, "skin_hit_target", (1, 1, 1, 1)))
         else:
             drum_edge = 2.0 * g.drum_x            # = INPUT_DRUM_WIDTH * scale
+            _dba = getattr(self.cfg, "drum_bg_alpha", 1.0) if self.cfg else 1.0
             sp.append(Sprite(drum_edge / 2, cy, drum_edge, strip_h, None,
-                             (0, 0, 0, 1.0)))                   # input-drum: solid black
+                             (0, 0, 0, _dba)))                   # input-drum bg (lazer 1.0)
             rw = w - drum_edge
             sp.append(Sprite(drum_edge + rw / 2, cy, rw, strip_h, None,
                              (0, 0, 0, 0.7)))                   # note lane: black @0.7
