@@ -146,6 +146,7 @@ class RenderConfig:
     fps: int = 60
     encoder: str = "auto"
     encoder_device: str | None = None
+    video_bitrate: int | None = None   # override the auto bitrate ladder (bps)
     skin_dir: Path | None = None
     default_skin_dir: Path | None = None
     # Beatmap hitsounds (lazer BeatmapHitsounds, default on): off drops the
