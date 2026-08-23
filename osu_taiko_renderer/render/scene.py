@@ -303,6 +303,11 @@ class TaikoSim:
         _in = self.skin.load("taiko-drum-inner")
         self._drum_inner_ratio = (_in.shape[1] / _bl.shape[1]
                                   if (_in is not None and _bl is not None) else 0.49)
+        # Half-width of a press graphic = its OWN aspect (w/h) scaled to the drum
+        # height. Same-sprite ratio -> scale-invariant, so an @2x drum-inner mixed
+        # with an @1x bar-left no longer doubles the width (custom-skin drum bug).
+        self._drum_half_aspect = ((_in.shape[1] / _in.shape[0])
+                                  if _in is not None else 0.49)
 
         # Per-quadrant press timestamps for the input-drum flash. Each list is
         # already time-sorted (frames are sorted in parse_replay).
@@ -1383,13 +1388,13 @@ class TaikoSim:
             # circle/divider — the artist places it ~INPUT_DRUM_WIDTH/2 from the
             # LEFT, not at the texture's geometric centre — and the right half ends
             # up offset.
-            sp.append(Sprite(dw / 2.0, cy, dw, dd, "skin_drum_idle", (1, 1, 1, 1)))
-            iw = dw * self._drum_inner_ratio        # half-width press graphic
+            sp.append(Sprite(g.drum_x, cy, dw, dd, "skin_drum_idle", (1, 1, 1, 1)))
+            iw = dd * self._drum_half_aspect         # half-width press graphic (scale-invariant)
             # Left presses sit flush at the bar's left edge; right presses are the
             # left ones mirrored about drum_x. Rim is flipped opposite the Centre
             # (lazer gives the Rim sprite Scale(-1,1)): left kat flipped, right not.
-            cx_l = iw / 2.0                          # left edge at 0
-            cx_r = 2.0 * g.drum_x - iw / 2.0         # mirror of [0,iw] about drum_x
+            cx_l = g.drum_x - iw / 2.0               # left half, flat edge at drum_x
+            cx_r = g.drum_x + iw / 2.0               # right half mirrors, meets at drum_x
             for zone, key, cx, ok in (
                     ("cl", "skin_drum_inner", cx_l, self.sk_drum_in),
                     ("cr", "skin_drum_inner_r", cx_r, self.sk_drum_in),
