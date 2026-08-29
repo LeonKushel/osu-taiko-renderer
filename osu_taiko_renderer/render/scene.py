@@ -298,16 +298,25 @@ class TaikoSim:
             return (img.shape[1] / img.shape[0]) if img is not None else default
         self._barline_aspect = _aspect("taiko-barline", 0.05)
         self._drum_aspect = _aspect("taiko-bar-left", 1.0)
-        # drum-inner/outer are half-width left-side graphics; ratio vs bar-left.
-        _bl = self.skin.load("taiko-bar-left")
-        _in = self.skin.load("taiko-drum-inner")
-        self._drum_inner_ratio = (_in.shape[1] / _bl.shape[1]
-                                  if (_in is not None and _bl is not None) else 0.49)
-        # Half-width of a press graphic = its OWN aspect (w/h) scaled to the drum
-        # height. Same-sprite ratio -> scale-invariant, so an @2x drum-inner mixed
-        # with an @1x bar-left no longer doubles the width (custom-skin drum bug).
-        self._drum_half_aspect = ((_in.shape[1] / _in.shape[0])
-                                  if _in is not None else 0.49)
+        # drum-inner/outer are legacy press sprites drawn at their OWN logical
+        # size (lazer LegacyInputDrum keeps inner/rim native, no stretch to the
+        # bar-left base height). Store each as a (w,h) fraction of the bar-left
+        # logical height so the draw scales both dims off the drum box. Uses the
+        # @2x-aware logical_height so an @2x drum-inner vs @1x bar-left no longer
+        # over-scales (custom-skin drum bug).
+        def _logical_wh(nm):
+            im = self.skin.load(nm)
+            if im is None or not im.shape[0]:
+                return None
+            lh = self.skin.logical_height(nm) or float(im.shape[0])
+            k = lh / float(im.shape[0])
+            return (float(im.shape[1]) * k, lh)
+        _bl_lh = self.skin.logical_height("taiko-bar-left") or 200.0
+        def _drum_frac(nm):
+            wh = _logical_wh(nm)
+            return (wh[0] / _bl_lh, wh[1] / _bl_lh) if wh else (0.49, 0.49)
+        self._drum_inner_frac = _drum_frac("taiko-drum-inner")
+        self._drum_outer_frac = _drum_frac("taiko-drum-outer")
 
         # Per-quadrant press timestamps for the input-drum flash. Each list is
         # already time-sorted (frames are sorted in parse_replay).
@@ -1389,20 +1398,21 @@ class TaikoSim:
             # LEFT, not at the texture's geometric centre — and the right half ends
             # up offset.
             sp.append(Sprite(g.drum_x, cy, dw, dd, "skin_drum_idle", (1, 1, 1, 1)))
-            iw = dd * self._drum_half_aspect         # half-width press graphic (scale-invariant)
-            # Left presses sit flush at the bar's left edge; right presses are the
-            # left ones mirrored about drum_x. Rim is flipped opposite the Centre
-            # (lazer gives the Rim sprite Scale(-1,1)): left kat flipped, right not.
-            cx_l = g.drum_x - iw / 2.0               # left half, flat edge at drum_x
-            cx_r = g.drum_x + iw / 2.0               # right half mirrors, meets at drum_x
-            for zone, key, cx, ok in (
-                    ("cl", "skin_drum_inner", cx_l, self.sk_drum_in),
-                    ("cr", "skin_drum_inner_r", cx_r, self.sk_drum_in),
-                    ("rl", "skin_drum_outer_r", cx_l, self.sk_drum_out),
-                    ("rr", "skin_drum_outer", cx_r, self.sk_drum_out)):
+            # Each press half is drawn at its OWN logical size (inner for don,
+            # outer/rim for kat), not stretched to the drum-base height. Left
+            # presses sit flush at the bar's left edge; right presses mirror
+            # about drum_x. Rim is flipped opposite the Centre (lazer gives the
+            # Rim sprite Scale(-1,1)): left kat flipped, right not.
+            for zone, key, side, ok, (wf, hf) in (
+                    ("cl", "skin_drum_inner",   -1, self.sk_drum_in,  self._drum_inner_frac),
+                    ("cr", "skin_drum_inner_r", +1, self.sk_drum_in,  self._drum_inner_frac),
+                    ("rl", "skin_drum_outer_r", -1, self.sk_drum_out, self._drum_outer_frac),
+                    ("rr", "skin_drum_outer",   +1, self.sk_drum_out, self._drum_outer_frac)):
                 a = self._drum_flash(zone, t)
                 if ok and a > 0.01:
-                    sp.append(Sprite(cx, cy, iw, dd, key,
+                    pw, ph = dd * wf, dd * hf
+                    cx = g.drum_x + side * pw / 2.0
+                    sp.append(Sprite(cx, cy, pw, ph, key,
                                      (1, 1, 1, min(1.0, a * 2.0))))
         else:
             sp.append(Sprite(g.drum_x, cy, g.drum_d, g.drum_d, "argon_drum_idle",
