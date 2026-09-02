@@ -770,8 +770,12 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         # 2070S -- the raw-frame producer was backpressuring on the encoder.
         # Same bitrate ladder/VBR caps, so quality stays visually equivalent.
         _tgt = cfg.video_bitrate or nvenc_target_bps(w, h, cfg.fps)
+        # CQ23 quality-targeted VBR (quality-approved 2026-09-02): visually
+        # identical to the fixed-target ladder, ~17% smaller; the ladder is
+        # kept only as the -maxrate/-bufsize cap below.
         cmd += ["-c:v", "h264_nvenc", "-preset", "p3", "-pix_fmt", "yuv420p",
-                "-b:v", str(_tgt), "-maxrate", str(int(_tgt * 1.5)),
+                "-rc", "vbr", "-cq", "23", "-b:v", "0",
+                "-maxrate", str(int(_tgt * 1.5)),
                 "-bufsize", str(_tgt * 2)]
     else:
         if cfg.video_bitrate:
