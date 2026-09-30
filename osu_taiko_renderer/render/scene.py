@@ -20,6 +20,7 @@ import os
 import numpy as np
 
 from osu_taiko_renderer.argon import _const as AC
+from osu_taiko_renderer.argon.textures import _GLOW_PAD
 from osu_taiko_renderer.argon import geometry as ag_geom
 from osu_taiko_renderer.render.dim import build_dim_envelope
 from osu_taiko_renderer.skin.taiko_skin import TaikoSkin
@@ -1417,6 +1418,22 @@ class TaikoSim:
         else:
             sp.append(Sprite(g.drum_x, cy, g.drum_d, g.drum_d, "argon_drum_idle",
                              (1, 1, 1, 1)))
+            # Press flashes as ADDITIVE GL sprites on the idle's EXACT route
+            # so they align to the drum outline by construction. The flash
+            # texture bakes its drum at 1/_GLOW_PAD, so a sprite sized
+            # drum_d*_GLOW_PAD renders the inner drum at exactly drum_d,
+            # centred at drum_x -- same size + centre as the idle, with none
+            # of the CPU double-round / int placement snap that made the old
+            # _add_prescaled path sit proud of the rim.
+            for _z, _key in (("cl", "argon_drum_centre_l"),
+                             ("cr", "argon_drum_centre_r"),
+                             ("rl", "argon_drum_rim_l"),
+                             ("rr", "argon_drum_rim_r")):
+                _a = self._drum_flash(_z, t)
+                if _a > 0.01:
+                    sp.append(Sprite(g.drum_x, cy,
+                                     g.drum_d * _GLOW_PAD, g.drum_d * _GLOW_PAD,
+                                     _key, (1, 1, 1, _a), additive=True))
 
         # --- hit target: Argon double circle + white bars. A skin lane
         # (taiko-bar-right / taiko-bar-left) carries its own target mark, so
@@ -1759,15 +1776,10 @@ class TaikoSim:
     def drum_flashes(self, t: int):
         """Active input-drum press flashes: (is_rim, left, intensity 0..1) for
         each pressed quadrant, composited additively at the drum."""
-        out = []
-        if self.sk_drum:           # skin drum handles its own press in build_scene
-            return out
-        for zone, is_rim, left in (("cl", False, True), ("cr", False, False),
-                                   ("rl", True, True), ("rr", True, False)):
-            a = self._drum_flash(zone, t)
-            if a > 0.01:
-                out.append((is_rim, left, a))
-        return out
+        # Argon drum press flashes are now emitted as ADDITIVE GL sprites in
+        # build_scene (aligned to the idle by construction), and the skin drum
+        # always handled its own press. No CPU-composited drum flash remains.
+        return []
 
     def active_effects(self, t: int):
         """Effects to composite additively over the readback frame at time t:
