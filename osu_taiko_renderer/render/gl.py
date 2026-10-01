@@ -63,7 +63,7 @@ class SpriteRenderer:
         # isolation: e.g. 1070=index 1 for Pool B). EGL ignores
         # CUDA_VISIBLE_DEVICES, so the device must be selected explicitly.
         import os, sys
-        if sys.platform == "win32":
+        if sys.platform in ("win32", "darwin"):
             # Windows contributors: glcontext ships no EGL backend (ImportError
             # cannot import name egl), so use the default WGL standalone context.
             # R3D_EGL_DEVICE_INDEX is an EGL-only GPU pin (Linux pools).
