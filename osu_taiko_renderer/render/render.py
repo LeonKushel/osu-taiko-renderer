@@ -390,8 +390,19 @@ def render_core(
             print(f"[taiko-renderer] hitsound build skipped: {_e}", file=sys.stderr)
             hitsound = None
     is_nc = bool(int(getattr(meta, "mods", 0) or 0) & 512)   # Nightcore bit
+    # INLINE PREVIEW (R3D_PREVIEW_INLINE=1, default OFF): have the SAME ffmpeg
+    # that encodes the master also write the lean 720p30 preview embed as a
+    # second output, so it is finished the moment the render is. Without it the
+    # node re-encodes the finished master afterwards before anything can be
+    # published. Flag unset -> the ffmpeg command is built exactly as before.
+    preview_path = None
+    if os.environ.get("R3D_PREVIEW_INLINE") == "1":
+        preview_path = output_path.parent / (output_path.stem + ".embed.mp4")
+        print(f"[taiko] inline preview -> {preview_path.name}",
+              file=sys.stderr, flush=True)
     proc = _spawn_ffmpeg(cfg, output_path, audio, start_ms, rate, total_dur_s,
-                         hitsound=hitsound, is_nc=is_nc)
+                         hitsound=hitsound, is_nc=is_nc,
+                         preview_path=preview_path)
     # HUD: legacy (true-to-skin) when the skin ships a score font, else Argon.
     from osu_taiko_renderer.argon.hud import ArgonHud
     from osu_taiko_renderer.hud.skin_hud import LegacyHud
@@ -729,9 +740,22 @@ def nvenc_target_bps(w: int, h: int, fps: float) -> int:
     return int(min(16_000_000.0, max(2_500_000.0, target)))
 
 
+def _preview_video_bps(total_dur_s: "float | None") -> int:
+    """Video bitrate of the lean preview embed. Mirrors the contributor
+    client's makeEmbedVariant (and the bot's _transcode_embed_unbounded):
+    ~1.4 Mbps, lowered on long maps so the file stays <= ~24 MiB, floor 500k.
+    Same formula as the catch engine."""
+    vbps = 1_400_000
+    if total_dur_s and total_dur_s > 0:
+        vbps = int(24 * 1024 * 1024 * 8 / total_dur_s) - 128_000
+        vbps = max(500_000, min(1_400_000, vbps))
+    return vbps
+
+
 def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
                   start_ms: int, rate: float = 1.0, total_dur_s: float | None = None,
-                  hitsound: Path | None = None, is_nc: bool = False):
+                  hitsound: Path | None = None, is_nc: bool = False,
+                  preview_path: "Path | None" = None):
     w, h = cfg.resolution
     enc, dev = _probe_encoder(cfg)
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
@@ -755,10 +779,11 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
     if audio is not None and hitsound is not None:
         cmd += ["-i", str(hitsound)]
 
-    # video codec + pixel path
+    # video codec + pixel path (collected in `vc`; appended below)
+    vc: list = []
     if enc == "h264_vaapi":
         _vb = str(cfg.video_bitrate) if cfg.video_bitrate else "8M"
-        cmd += ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", _vb]
+        vc += ["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-b:v", _vb]
     elif enc == "h264_nvenc":
         # Resolution-scaled bitrate ladder (was flat 8M) -- R3D cross-engine
         # NVENC policy; see nvenc_target_bps above.
@@ -766,9 +791,9 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         # 2070S -- the raw-frame producer was backpressuring on the encoder.
         # Same bitrate ladder/VBR caps, so quality stays visually equivalent.
         _tgt = cfg.video_bitrate or nvenc_target_bps(w, h, cfg.fps)
-        cmd += ["-c:v", "h264_nvenc", "-preset", "p3", "-pix_fmt", "yuv420p",
-                "-b:v", str(_tgt), "-maxrate", str(int(_tgt * 1.5)),
-                "-bufsize", str(_tgt * 2)]
+        vc += ["-c:v", "h264_nvenc", "-preset", "p3", "-pix_fmt", "yuv420p",
+               "-b:v", str(_tgt), "-maxrate", str(int(_tgt * 1.5)),
+               "-bufsize", str(_tgt * 2)]
     else:
         # CPU-encode thread cap (R3D host-governance, 2026-09): leave >=2
         # logical cores free for the machine's owner. Uncapped, libx264 spawns
@@ -779,34 +804,86 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         _thr = ["-threads", str(max(2, (os.cpu_count() or 4) - 2))]
         if cfg.video_bitrate:
             _vb = int(cfg.video_bitrate)
-            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                    "-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
-                    "-bufsize", str(_vb * 2)] + _thr
+            vc += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                   "-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
+                   "-bufsize", str(_vb * 2)] + _thr
         else:
-            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                    "-crf", "20"] + _thr
+            vc += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                   "-crf", "20"] + _thr
 
-    if audio is not None:
-        if hitsound is not None:
-            # [1:a] song -> music chain; [2:a] hitsound dub scaled by the preset
-            # effects (general) volume AND the -8 LU music-match gain (so the
-            # hits drop with the music, not blast on top); amix without
-            # auto-normalise so neither side is ducked. Video (0) mapped explicitly.
-            hs_vol = max(0.0, cfg.general_volume / 100.0) * _HITSOUND_MUSIC_MATCH_GAIN
-            mc = music_chain if music_chain else "anull"
-            fc = ("[1:a]" + mc + "[m];"
-                  "[2:a]volume=" + f"{hs_vol:.3f}" + "[h];"
-                  "[m][h]amix=inputs=2:duration=longest:normalize=0:"
-                  "dropout_transition=0[aout]")
-            cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]"]
-        elif music_chain:
-            cmd += ["-af", music_chain]
-        cmd += ["-c:a", "aac", "-b:a", "192k", "-shortest"]
+    # The master's audio graph when a hitsound dub is mixed in (-> [aout]).
+    # [1:a] song -> music chain; [2:a] hitsound dub scaled by the preset
+    # effects (general) volume AND the -8 LU music-match gain (so the
+    # hits drop with the music, not blast on top); amix without
+    # auto-normalise so neither side is ducked.
+    fc = None
+    if audio is not None and hitsound is not None:
+        hs_vol = max(0.0, cfg.general_volume / 100.0) * _HITSOUND_MUSIC_MATCH_GAIN
+        mc = music_chain if music_chain else "anull"
+        fc = ("[1:a]" + mc + "[m];"
+              "[2:a]volume=" + f"{hs_vol:.3f}" + "[h];"
+              "[m][h]amix=inputs=2:duration=longest:normalize=0:"
+              "dropout_transition=0[aout]")
+    acodec = ["-c:a", "aac", "-b:a", "192k", "-shortest"]
 
-    # web-streamable: move the moov atom to the front so browsers/iOS can
-    # play before the whole file downloads (loudnorm re-adds this, but be
-    # robust if that post-step is skipped/fails).
-    cmd += ["-movflags", "+faststart", str(output_path)]
+    if preview_path is None:
+        cmd += vc
+        if audio is not None:
+            if fc is not None:
+                # Video (0) mapped explicitly.
+                cmd += ["-filter_complex", fc, "-map", "0:v", "-map", "[aout]"]
+            elif music_chain:
+                cmd += ["-af", music_chain]
+            cmd += acodec
+
+        # web-streamable: move the moov atom to the front so browsers/iOS can
+        # play before the whole file downloads (loudnorm re-adds this, but be
+        # robust if that post-step is skipped/fails).
+        cmd += ["-movflags", "+faststart", str(output_path)]
+    else:
+        # TWO OUTPUTS FROM ONE PROCESS. The frame pipe is read once; `split`
+        # hands the SAME rgb24 frames to the master encoder (unchanged
+        # settings; its rgb24 -> yuv420p conversion is still the encoder-side
+        # auto-inserted one, now after the split) and to a 720p30 libx264
+        # preview. The audio graph is the master's own, then `asplit`; the
+        # preview branch gets the loudness pass the contributor client would
+        # otherwise apply before cutting its embed, so the preview needs no
+        # post-processing at all. Taiko frames arrive top-down (no vflip on
+        # the master), so the preview needs no flip either.
+        graph = []
+        pfps = min(30, int(round(float(cfg.fps))))
+        vm_tail = "null"
+        if enc == "h264_vaapi":
+            # the master's "-vf format=nv12,hwupload" moves into the graph
+            vm_tail = "format=nv12,hwupload"
+            vc = [x for i, x in enumerate(vc)
+                  if not (x == "-vf" or (i and vc[i - 1] == "-vf"))]
+        graph.append(f"[0:v]split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
+                     f"[vp0]scale=-2:720,fps={pfps}[vp]")
+        if audio is not None:
+            if fc is not None:
+                graph.append(fc)
+            else:
+                graph.append(f"[1:a]{music_chain or 'anull'}[aout]")
+            graph.append("[aout]asplit=2[am][ap0];"
+                         "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
+        cmd += ["-filter_complex", ";".join(graph)]
+        # output 1: the master, exactly as without the preview
+        cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio is not None else [])
+        cmd += vc + (acodec if audio is not None else [])
+        cmd += ["-movflags", "+faststart", str(output_path)]
+        # output 2: the preview. libx264 on every node, deliberately: a second
+        # NVENC/VAAPI session can fail to open (session limits), and one failed
+        # output kills the whole process and with it the render.
+        vbps = _preview_video_bps(total_dur_s)
+        cmd += ["-map", "[vp]"] + (["-map", "[ap]"] if audio is not None else [])
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
+                "-bufsize", str(vbps * 2), "-g", "30",
+                "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
+        if audio is not None:
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-shortest"]
+        cmd += ["-movflags", "+faststart", str(preview_path)]
     import tempfile
     errf = tempfile.NamedTemporaryFile(
         prefix="catch_ffmpeg_", suffix=".log", delete=False, mode="w+",
