@@ -750,6 +750,20 @@ def _ffmpeg_has(name: str) -> bool:
     return name in out
 
 
+# ---- libx264 knobs behind env hooks (same names in all four engines) --------
+# libx264 is the master encoder wherever a node has no hardware encoder (every
+# Mac). The four engines ask it for different things (std crf 16 / faster,
+# taiko crf 20 / veryfast, catch crf 23 / veryfast, mania 2500k / medium), so
+# these make the choice settable per run without a code edit:
+#   R3D_X264_PRESET   R3D_X264_CRF   R3D_X264_THREADS   R3D_X264_PARAMS
+# THE DEFAULTS REPRODUCE THIS ENGINE'S CURRENT COMMAND EXACTLY (veryfast, crf 20, cores - 2 threads):
+# with none of them set the ffmpeg argv is unchanged, argument for argument.
+_X264_PRESET = os.environ.get("R3D_X264_PRESET", "").strip()
+_X264_CRF = os.environ.get("R3D_X264_CRF", "").strip()
+_X264_THREADS = os.environ.get("R3D_X264_THREADS", "").strip()
+_X264_PARAMS = os.environ.get("R3D_X264_PARAMS", "").strip()
+
+
 def nvenc_target_bps(w: int, h: int, fps: float) -> int:
     """Resolution-scaled NVENC bitrate ladder (R3D cross-engine policy, 2026-07).
 
@@ -911,15 +925,19 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         # contributor's desktop (the rel/Stella "semi-crash"). Harmless on
         # dedicated render boxes: libx264 is only the no-HW-encoder fallback.
         # Same cap in all four engines (catch/taiko/std/mania v2).
-        _thr = ["-threads", str(max(2, (os.cpu_count() or 4) - 2))]
+        _thr = ["-threads", _X264_THREADS
+                or str(max(2, (os.cpu_count() or 4) - 2))]
+        if _X264_PARAMS:
+            _thr += ["-x264-params", _X264_PARAMS]
+        _preset = _X264_PRESET or "veryfast"
         if cfg.video_bitrate:
             _vb = int(cfg.video_bitrate)
-            vc += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            vc += ["-c:v", "libx264", "-preset", _preset, "-pix_fmt", "yuv420p",
                    "-b:v", str(_vb), "-maxrate", str(int(_vb * 1.5)),
                    "-bufsize", str(_vb * 2)] + _thr
         else:
-            vc += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                   "-crf", "20"] + _thr
+            vc += ["-c:v", "libx264", "-preset", _preset, "-pix_fmt", "yuv420p",
+                   "-crf", _X264_CRF or "20"] + _thr
 
     # The master's audio graph when a hitsound dub is mixed in (-> [aout]).
     # [1:a] song -> music chain; [2:a] hitsound dub scaled by the preset
