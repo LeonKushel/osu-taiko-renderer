@@ -1007,11 +1007,11 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             c_h = min(c_h, int(h))
             c_fps = min(c_fps, int(round(float(cfg.fps))))
             graph.append(f"[0:v]split=3[vm0][vp0][vc0];[vm0]{vm_tail}[vm];"
-                         f"[vp0]scale=-2:720,fps={pfps}[vp];"
-                         f"[vc0]scale=-2:{c_h}:flags=bilinear,fps={c_fps}[vc]")
+                         f"[vp0]fps={pfps},scale=-2:720[vp];"
+                         f"[vc0]fps={c_fps},scale=-2:{c_h}:flags=bilinear[vc]")
         else:
             graph.append(f"[0:v]split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
-                         f"[vp0]scale=-2:720,fps={pfps}[vp]")
+                         f"[vp0]fps={pfps},scale=-2:720[vp]")
         if audio is not None:
             if fc is not None:
                 graph.append(fc)
