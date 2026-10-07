@@ -24,6 +24,7 @@ from PIL import Image, ImageDraw, ImageFont
 from osu_taiko_renderer.skin.assets import build_textures
 from osu_taiko_renderer.beatmap.beatmap import parse_beatmap
 from osu_taiko_renderer.render.gl import SpriteRenderer
+from osu_taiko_renderer.render import preview_hw as _phw
 from osu_taiko_renderer.beatmap.models import RenderConfig
 from osu_taiko_renderer.beatmap.replay import parse_replay
 from osu_taiko_renderer.render.scene import TaikoSim
@@ -681,6 +682,11 @@ def render_core(
         errlog = getattr(proc, "_catch_errlog", None)
         if errlog and Path(errlog).exists():
             tail = Path(errlog).read_text(errors="replace")[-800:]
+        # a hardware preview that failed must not fail the NEXT render too
+        if _phw.note_preview_failure(list(getattr(proc, "args", []) or []),
+                                     tail.encode("utf-8", "replace")):
+            tail += ("\n[the preview's hardware encoder is now off for 24 h on "
+                     "this node; the next render uses the CPU preview]")
         raise TaikoRenderError(f"ffmpeg exited {ret}\n{tail}")
     if not output_path.exists() or output_path.stat().st_size < 8_000:
         raise TaikoRenderError("output too small / missing — render likely failed")
@@ -994,6 +1000,17 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
         # the master), so the preview needs no flip either.
         graph = []
         pfps = min(30, int(round(float(cfg.fps))))
+        # hardware preview (render/preview_hw.py; a Mac's media engine, where
+        # the probe passes): the first frame repeated in front, cut off again
+        # after encoding. "" leaves the graph as it was.
+        # Only when the master is on a software encoder: then the preview's is
+        # the one hardware session this process holds. A master that is itself
+        # on a hardware encoder keeps the preview on x264 (a second session can
+        # be refused, and one failed output kills the render).
+        preview_hw = str(enc).startswith("lib") and _phw.preview_on_media_engine()
+        if preview_hw and audio is not None and not (total_dur_s and total_dur_s > 0):
+            preview_hw = False   # no known length to end the audio at: stay on x264
+        _lead = ("," + _phw.vt_lead_in_filter(pfps)) if preview_hw else ""
         vm_tail = "null"
         if enc == "h264_vaapi":
             # the master's "-vf format=nv12,hwupload" moves into the graph
@@ -1007,11 +1024,11 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             c_h = min(c_h, int(h))
             c_fps = min(c_fps, int(round(float(cfg.fps))))
             graph.append(f"[0:v]split=3[vm0][vp0][vc0];[vm0]{vm_tail}[vm];"
-                         f"[vp0]fps={pfps},scale=-2:720[vp];"
+                         f"[vp0]fps={pfps},scale=-2:720{_lead}[vp];"
                          f"[vc0]fps={c_fps},scale=-2:{c_h}:flags=bilinear[vc]")
         else:
             graph.append(f"[0:v]split=2[vm0][vp0];[vm0]{vm_tail}[vm];"
-                         f"[vp0]fps={pfps},scale=-2:720[vp]")
+                         f"[vp0]fps={pfps},scale=-2:720{_lead}[vp]")
         if audio is not None:
             if fc is not None:
                 graph.append(fc)
@@ -1031,22 +1048,41 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
             else:
                 graph.append("[aout]asplit=2[am][ap0];"
                              "[ap0]loudnorm=I=-18:TP=-1.5:LRA=11[ap]")
+        if _lead and audio is not None:
+            # `-shortest` measures the preview's video BEFORE the lead-in is cut
+            # off, so it cannot be used on this output (see where it is left out
+            # below). The video's length is known here: end the preview's audio
+            # there, which is what `-shortest` does for the x264 preview.
+            graph[-1] = graph[-1].replace("[ap]", "[ap_full]")
+            graph.append(f"[ap_full]atrim=end={float(total_dur_s):.6f}[ap]")
         cmd += ["-filter_complex", ";".join(graph)]
         # output 1: the master, exactly as without the preview
         cmd += ["-map", "[vm]"] + (["-map", "[am]"] if audio is not None else [])
         cmd += vc + (acodec if audio is not None else [])
         cmd += _mfast + [str(output_path)]
-        # output 2: the preview. libx264 on every node, deliberately: a second
-        # NVENC/VAAPI session can fail to open (session limits), and one failed
-        # output kills the whole process and with it the render.
+        # output 2: the preview. libx264 unless a hardware session was proved
+        # to open here (`preview_hw`): a second NVENC/VAAPI session can fail to
+        # open (session limits), and one failed output kills the whole process
+        # and with it the render. On a Mac the master is on x264, so the
+        # preview's is the only hardware session this process holds.
         vbps = _preview_video_bps(total_dur_s)
         cmd += ["-map", "[vp]"] + (["-map", "[ap]"] if audio is not None else [])
-        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
-                "-bufsize", str(vbps * 2), "-g", "30",
-                "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
+        if preview_hw:
+            cmd += _phw.hw_video_args(vbps, pfps)
+        else:
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+                    "-b:v", str(vbps), "-maxrate", str(int(vbps * 1.25)),
+                    "-bufsize", str(vbps * 2), "-g", "30",
+                    "-threads", str(max(2, min(4, (os.cpu_count() or 4) - 2)))]
         if audio is not None:
-            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000", "-shortest"]
+            cmd += ["-c:a", "aac", "-b:a", "128k", "-ar", "48000"]
+            if not _lead:
+                cmd += ["-shortest"]
+            # with the lead-in `-shortest` is wrong in both directions: it
+            # compares the streams BEFORE the lead-in is cut off, so it either
+            # lets extra audio through or, once the audio is ended at the
+            # video's length (the atrim above), cuts the last half second of
+            # VIDEO. The audio is ended explicitly instead.
         cmd += _preview_sink_args(preview_path)
         if compact_path is not None:
             # output 3: the Discord copy. Same recipe as the node's own compact
