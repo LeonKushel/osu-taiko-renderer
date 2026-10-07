@@ -40,6 +40,27 @@ def _over(dst_a: np.ndarray, src_a: np.ndarray, x: int) -> None:
     dst_a[y0:y1, x0:x1] = s + d * (1.0 - s)
 
 
+import os as _os_cp
+import time as _time_cp
+from osu_taiko_renderer.render.envflag import envflag
+_CPROF = envflag("R3D_TAIKO_CPROF")
+_cprof_now = _time_cp.perf_counter
+_CSTAT = {"hit": 0, "miss": 0, "t": 0.0, "px": 0, "frames": 0}
+if _CPROF:
+    import atexit as _atx_cp
+
+    @_atx_cp.register
+    def _cp_dump():
+        import sys as _s
+        f = max(1, _CSTAT["frames"])
+        tot = _CSTAT["hit"] + _CSTAT["miss"]
+        print(f"[counter-prof] ArgonCounter.render: {tot/f:.2f} calls/frame, "
+              f"{_CSTAT['hit']/max(1,tot)*100:.1f}% cache hits", file=_s.stderr)
+        print(f"[counter-prof]   MISSES {_CSTAT['miss']/f:.2f}/frame costing "
+              f"{_CSTAT['t']/f*1e3:.3f} ms/frame over {_CSTAT['px']/max(1,_CSTAT['miss']):.0f} px each",
+              file=_s.stderr)
+
+
 class ArgonCounter:
     def __init__(self):
         self.g: dict[str, np.ndarray] = {}
@@ -59,7 +80,11 @@ class ArgonCounter:
             return hit
         a = arr[..., 3]
         out = (np.asarray(Image.fromarray((a * 255).astype(np.uint8))
-               .resize((cell, cell), Image.LANCZOS)).astype(np.float32) / 255.0)
+               # Image.LANCZOS is real at runtime (== 1); Pillow's stubs moved it
+               # under Image.Resampling, and mypyc refuses to build a module with
+               # any type error at all.
+               .resize((cell, cell), Image.LANCZOS))  # type: ignore[attr-defined]
+               .astype(np.float32) / 255.0)
         self._scache[key] = out
         return out
 
@@ -75,7 +100,10 @@ class ArgonCounter:
         key = (text, cell, round(wire_alpha, 2), color)
         hit = self._rcache.get(key)
         if hit is not None:
+            if _CPROF:
+                _CSTAT["hit"] += 1
             return hit
+        _t0 = _cprof_now() if _CPROF else 0.0
         gap = int(round(cell * 0.03))                 # slight overlap (spacing -2)
         W = max(1, len(text) * cell - (len(text) - 1) * gap)
         # Accumulate ALPHA only; RGB is flat white (all sprites are white) so
@@ -98,4 +126,8 @@ class ArgonCounter:
         if len(self._rcache) > 2048:
             self._rcache.clear()
         self._rcache[key] = out8
+        if _CPROF:
+            _CSTAT["miss"] += 1
+            _CSTAT["t"] += _cprof_now() - _t0
+            _CSTAT["px"] += out8.shape[0] * out8.shape[1]
         return out8

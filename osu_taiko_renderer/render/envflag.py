@@ -1,0 +1,62 @@
+"""Parse an R3D_* switch the way a reader expects.
+
+`bool(os.environ.get(X))` is True for the STRING "0", so `R3D_FOO=0` turns the
+feature ON. That has cost an invalid A/B before (both arms instrumented). Every
+switch added with the speed work goes through this instead."""
+from __future__ import annotations
+
+import os
+import sys
+
+_OFF = ("", "0", "false", "no", "off")
+
+
+def envflag(name: str, default: bool = False) -> bool:
+    v = os.environ.get(name)
+    if v is None:
+        return default
+    return v.strip().lower() not in _OFF
+
+
+
+# ---- which render-path speedups are on with no switch set --------------------
+# The same rule as std's render/perf.py: each speedup stays a switch (R3D_X=0
+# off, R3D_X=1 on, on any platform), a platform where the whole set has been
+# built, timed and checked frame by frame gets it by default, and
+# R3D_TAIKO_STOCK=1 turns the whole set off at once: the stock render path, for
+# regression gates ("does stock still equal main?") and for bisecting.
+STOCK = envflag("R3D_TAIKO_STOCK")
+FAST_DEFAULT = False
+
+
+def _fast(name: str) -> bool:
+    return envflag(name, FAST_DEFAULT) and not STOCK
+
+
+# The switches that depend on each other are resolved ONCE, here, and every
+# module imports the result, so two modules cannot disagree. Each module used to
+# read its own copy, and one of them (the flashlight) read R3D_TAIKO_GPU_FL
+# without the "needs GPU_FX" half: GPU_FL=1 alone turned the CPU spotlight off
+# and never drew the GPU one.
+GPU_FX = _fast("R3D_TAIKO_GPU_FX")                     # effects in the GL pass
+# Not switches of their own any more, because the half-set was a wrong picture:
+# effects without the skin judgements dropped the legacy-lane hit flash, and the
+# flashlight recomputed in GLSL instead of sampled was a level off in places.
+GPU_SJ = GPU_FX                                        # + skin judgements
+GPU_FL = _fast("R3D_TAIKO_GPU_FL") and GPU_FX          # flashlight in the pass
+FL_EXACT = GPU_FL                                      # ... sampled, not recomputed
+GPU_NUM = _fast("R3D_TAIKO_GPU_NUM") and GPU_FX        # HUD numbers in the pass
+GPU_HUD = _fast("R3D_TAIKO_GPU_HUD") and GPU_FX        # the whole HUD in the pass
+GPU_BREAK = _fast("R3D_TAIKO_GPU_BREAK") and GPU_HUD   # break overlay's shadow
+MERGE_RUNS = _fast("R3D_TAIKO_MERGE_RUNS") and GPU_FX  # fewer blend runs per frame
+# round to nearest when a blend is stored to 8 bits, as GL (and catch, and std)
+# do, instead of truncating; with it the CPU and GPU composites agree
+ROUND = _fast("R3D_TAIKO_ROUND")
+MAP_READBACK = _fast("R3D_MAP_READBACK") and sys.platform == "darwin"
+SOCKET_PIPE = _fast("R3D_MAC_SOCKET_PIPE") and sys.platform == "darwin"
+RESULTS_AHEAD = _fast("R3D_TAIKO_RESULTS_AHEAD")
+GPU_YUV = _fast("R3D_TAIKO_GPU_YUV")      # asked for; gl.py checks the local ffmpeg
+# not in the default set: one draw call per blend run. It was slower than the
+# per-sprite path on taiko's short runs, and an additive sprite's fractional
+# alpha lands one level apart as a vertex attribute (4 frames of the fixture).
+INSTANCED = envflag("R3D_TAIKO_INSTANCED") and not STOCK

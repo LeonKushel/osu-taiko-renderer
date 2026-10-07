@@ -1781,20 +1781,98 @@ class TaikoSim:
         # always handled its own press. No CPU-composited drum flash remains.
         return []
 
+    # The widest age any effect can still be alive at. Judgement popups live
+    # longest (JUDGE_MOVE_MS = 800); explosions are 450+30 (GREAT) or 200+30 (OK).
+    # Used as the bisect window below — anything judged more than this long ago
+    # cannot contribute, so it need not be visited.
+    _FX_MAX_AGE = max(AC.JUDGE_MOVE_MS,
+                      AC.EXPLOSION_GREAT_OUT_MS + AC.EXPLOSION_GREAT_IN_MS,
+                      AC.EXPLOSION_OK_OUT_MS + AC.EXPLOSION_GREAT_IN_MS)
+
+    def _build_fx_index(self):
+        """Build the sorted-by-JUDGED-TIME index `active_effects` bisects.
+
+        WHY THIS EXISTS: `active_effects` used to scan EVERY note on EVERY frame
+        (`for o in self.notes`) to find the ~10 that are still animating. On a
+        2381-note map over 15080 frames that is **36 million iterations**, and it
+        measured **0.425 ms/frame — 17% of the entire frame**, more than `gl_draw`
+        and `break_overlay` combined. It hid inside the `sb_fx` stage bucket,
+        whose window happens to enclose this call, so the stage table blamed
+        sprite building (0.023 ms) for it.
+        `build_scene` already solved the same problem with a bisect window
+        (`_win`), but that window is keyed on `o.time_ms` and bounded by scroll
+        speed — the wrong axis here, because effects are keyed on the note's
+        JUDGED time, which is unrelated to when it scrolled past.
+
+        SAFE TO PRECOMPUTE: `note_hit` is filled once while the sim is built and
+        never mutated during rendering, so this index is stable. It is built
+        lazily on first use because `note_hit` is populated after __init__.
+
+        TWO GROUPS, and the second one is not obvious:
+          * `_fx_hits` — notes that HAVE a judgement. Sorted by judged time so a
+            bisect gives exactly the notes whose age is in [0, _FX_MAX_AGE].
+          * `_fx_unjudged` — notes with NO entry in `note_hit`. The old code read
+            them through `.get(id(o), (0, MISS))`, i.e. judged-at-zero-and-MISSED,
+            so `age == t` for them. That makes the popup test
+            `0 <= age <= JUDGE_MOVE_MS` true for EVERY unjudged note while
+            `0 <= t <= 800 ms` — a burst of one popup per unjudged note at map
+            start (2381 of them on this map; it is why the measured average was
+            7.58 judgements/frame rather than ~0). **Reproduced deliberately so
+            this stays byte-identical.** Whether that burst is desirable is a
+            separate question — see the note in the ledger.
+
+        Each entry keeps the note's ORIGINAL INDEX, because the old loop emitted
+        in note order and a stacked judgement's draw order is its z-order. The
+        window is re-sorted by that index before returning.
+        """
+        hits = []
+        unjudged = []
+        nh = self.note_hit
+        for i, o in enumerate(self.notes):
+            e = nh.get(id(o))
+            is_kat = o.kind is TaikoType.KAT
+            if e is None:
+                unjudged.append((i, o.big))
+            else:
+                hits.append((e[0], i, e[1], is_kat, o.big))
+        hits.sort(key=lambda r: r[0])
+        self._fx_hits = hits
+        self._fx_hit_rts = [r[0] for r in hits]
+        self._fx_unjudged = unjudged
+
     def active_effects(self, t: int):
         """Effects to composite additively over the readback frame at time t:
         (explosions, judgements). explosions: (is_rim, age_ms, big, result).
-        judgements: (result, age_ms). Both keyed off each note's judged time."""
-        exps = []
-        judges = []
-        for o in self.notes:
-            rt, res = self.note_hit.get(id(o), (0, MISS))
+        judgements: (result, age_ms). Both keyed off each note's judged time.
+
+        Bisect-windowed over `_build_fx_index`; byte-identical to the old
+        full-note scan, including the map-start unjudged burst. See that method
+        for why the window is on judged time and not on `o.time_ms`.
+        """
+        if getattr(self, "_fx_hits", None) is None:
+            self._build_fx_index()
+        # age = t - rt must satisfy 0 <= age <= _FX_MAX_AGE, i.e.
+        # t - _FX_MAX_AGE <= rt <= t. Both bounds are exact, not conservative.
+        rts = self._fx_hit_rts
+        lo = bisect.bisect_left(rts, t - self._FX_MAX_AGE)
+        hi = bisect.bisect_right(rts, t)
+        exps_i = []
+        judges_i = []
+        for rt, i, res, is_kat, big in self._fx_hits[lo:hi]:
             age = t - rt
             if res != MISS:
                 dur = (AC.EXPLOSION_GREAT_OUT_MS if res == GREAT
                        else AC.EXPLOSION_OK_OUT_MS)
                 if 0 <= age <= dur + AC.EXPLOSION_GREAT_IN_MS:
-                    exps.append((o.kind is TaikoType.KAT, age, o.big, res))
+                    exps_i.append((i, (is_kat, age, big, res)))
             if 0 <= age <= AC.JUDGE_MOVE_MS:
-                judges.append((res, age, rt, o.big))
-        return exps, judges
+                judges_i.append((i, (res, age, rt, big)))
+        # The unjudged group: rt is 0 for all of them, so they are either ALL
+        # in the popup window or none are. One test, not one per note.
+        if 0 <= t <= AC.JUDGE_MOVE_MS:
+            for i, big in self._fx_unjudged:
+                judges_i.append((i, (MISS, t, 0, big)))
+        # restore note order — the old loop's emission order, hence z-order
+        exps_i.sort(key=lambda r: r[0])
+        judges_i.sort(key=lambda r: r[0])
+        return [e for _, e in exps_i], [j for _, j in judges_i]

@@ -80,6 +80,7 @@ from PIL import Image, ImageDraw, ImageFilter
 
 from osu_taiko_renderer.argon.counter import ArgonCounter
 from osu_taiko_renderer.argon.font import get_font
+from osu_taiko_renderer.render.envflag import envflag
 
 # --- lazer constants (files cited in the module docstring) -------------------
 MIN_BREAK_DURATION = 650.0        # BreakPeriod.MIN_BREAK_DURATION (HasEffect)
@@ -123,6 +124,27 @@ LAZER_UI_HEIGHT = 768.0
 # ScoreRank.GetLocalisableDescription(): X="SS", XH="Silver SS",
 # SH="Silver S" (osu-resources Localisation/Web).
 _HD, _FL = 1 << 3, 1 << 10
+
+
+_GL_SHADOW_KEY = "brk_shadow"
+
+# R3D_TAIKO_ROUND: round-to-nearest on the 8-bit store instead of truncating.
+# This module was MISSED when that flag was introduced -- it reached
+# argon/compositor._to8 and argon/hud._to8 but not _paste/_add here, which still
+# ended in a bare `.astype(np.uint8)`. Consequences:
+#   * truncation is a BIASED estimator: it loses on average half a level on every
+#     blended pixel, so the whole break overlay renders systematically DARK;
+#   * it made the GL shadow sprite look wrong when it was not. Measured against
+#     the CPU paste: 643,460 pixels differing, +1 on EVERY ONE of them, never -1
+#     and never by more than 1 -- GL rounds, this truncated. With rounding on,
+#     the GL shadow matches.
+from osu_taiko_renderer.render.envflag import ROUND as _ROUND  # noqa: E402
+
+
+def _to8(x):
+    """Clip to 0..255 and store as uint8, rounding per _ROUND."""
+    c = np.clip(x, 0, 255)
+    return np.rint(c).astype(np.uint8) if _ROUND else c.astype(np.uint8)
 
 
 def _out_quint(u: float) -> float:
@@ -293,9 +315,9 @@ class LazerBreakOverlay:
             return
         s = src[y0 - y:y1 - y, x0 - x:x1 - x].astype(np.float32)
         a = (s[..., 3:4] / 255.0) * alpha
-        region = rgb[y0:y1, x0:x1].astype(np.float32)
+        region = rgb[y0:y1, x0:x1, :3].astype(np.float32)
         region = region * (1.0 - a) + s[..., :3] * a
-        rgb[y0:y1, x0:x1] = np.clip(region, 0, 255).astype(np.uint8)
+        rgb[y0:y1, x0:x1, :3] = _to8(region)
 
     @staticmethod
     def _add(rgb: np.ndarray, field: np.ndarray, cx: float, cy: float,
@@ -313,13 +335,85 @@ class LazerBreakOverlay:
         if ix1 <= ix0 or iy1 <= iy0:
             return
         sub = field[iy0 - y0:iy1 - y0, ix0 - x0:ix1 - x0] * alpha
-        base = rgb[iy0:iy1, ix0:ix1].astype(np.float32)
-        rgb[iy0:iy1, ix0:ix1] = np.clip(base + sub, 0.0, 255.0
-                                        ).astype(np.uint8)
+        base = rgb[iy0:iy1, ix0:ix1, :3].astype(np.float32)
+        rgb[iy0:iy1, ix0:ix1, :3] = _to8(base + sub)
 
     # --- per-frame -----------------------------------------------------------
 
-    def draw(self, rgb: np.ndarray, t_ms: float, accuracy: float) -> None:
+    def shadow_alpha(self, t_ms: float) -> float:
+        """The fadeContainer alpha at `t_ms`, as a PURE function — no state.
+
+        draw() advances `_bar_w`/`_last_t` and must stay the single place that
+        does; this only reproduces the alpha/period arithmetic so the shadow can
+        be emitted as a GL sprite at DRAW time (before readback) while the rest
+        of the overlay still composites on the CPU after it. Mirrors draw()
+        exactly: same bisect, same window, same fade formula."""
+        if not self.periods:
+            return 0.0
+        t = float(t_ms)
+        idx = bisect_right(self._starts, t) - 1
+        if idx < 0:
+            return 0.0
+        s0, D = self.periods[idx]
+        if t > s0 + D + BREAK_FADE_MS:
+            return 0.0
+        tp = t - s0
+        if tp >= D:
+            a = max(0.0, 1.0 - (tp - D) / BREAK_FADE_MS)
+        else:
+            a = min(1.0, tp / BREAK_FADE_MS)
+        return a if a > 0.004 else 0.0
+
+    def gl_shadow_sprite(self, t_ms: float, gl):
+        """The break shadow as ONE straight-alpha GL sprite, or None.
+
+        The shadow is the FIRST (bottom) element of the overlay and, at 1080p,
+        844x737 = 622k of the overlay's ~1.13M composited pixels. On the CPU
+        `_paste` allocates ~51 MB of float32 temporaries for it EVERY break
+        frame (s 9.95 + a 2.49 + region 7.46, then four more 7.46 MB passes) —
+        ~3.4 GB/s at the measured ~15 ms per break frame.
+
+        Only the shadow moves. Being the bottom element, drawing it in the GL
+        pass keeps the stacking identical: HUD < shadow < rest-of-break, because
+        everything else still composites on the CPU after readback. Moving a
+        MIDDLE element would put it under the CPU elements that belong below it.
+
+        Placement reproduces `_paste`: integer top-left `int(round(c - n/2))`,
+        so the quad is texel-aligned and GL does not resample.
+        """
+        a = self.shadow_alpha(t_ms)
+        if a <= 0.0:
+            return None
+        from osu_taiko_renderer.beatmap.models import Sprite
+        h, w = self._shadow.shape[:2]
+        if not getattr(self, "_gl_shadow_up", False):
+            gl.upload_texture(_GL_SHADOW_KEY, self._shadow)
+            self._gl_shadow_up = True
+        x0 = int(round(self.w / 2.0 - w / 2.0))
+        y0 = int(round(self.h / 2.0 - h / 2.0))
+        return Sprite(x0 + w / 2.0, y0 + h / 2.0, w, h,
+                      texture_key=_GL_SHADOW_KEY,
+                      color=(1.0, 1.0, 1.0, float(a)))
+
+    def will_draw(self, t_ms: float) -> bool:
+        """Would draw() change the frame at map time t_ms? Pure (no state), and
+        the same two tests draw() makes before it touches a pixel."""
+        if not self.periods:
+            return False
+        t = float(t_ms)
+        idx = bisect_right(self._starts, t) - 1
+        if idx < 0:
+            return False
+        s0, D = self.periods[idx]
+        if t > s0 + D + BREAK_FADE_MS:
+            return False
+        tp = t - s0
+        alpha = (max(0.0, 1.0 - (tp - D) / BREAK_FADE_MS) if tp >= D
+                 else min(1.0, tp / BREAK_FADE_MS))
+        return alpha > 0.004
+
+    def draw(self, rgb: np.ndarray, t_ms: float, accuracy: float,
+             skip_shadow: bool = False) -> None:
         """Compose the overlay for map time t_ms onto the numpy RGB frame
         (mutated in place, like the HUD blits). Called every frame (the bar
         damp runs continuously, like lazer's Update); cheap no-op outside
@@ -363,8 +457,10 @@ class LazerBreakOverlay:
         cx, cy = self.w / 2.0, self.h / 2.0
         p_in = _out_quint(tp / BREAK_FADE_MS)
 
-        # 1) shadow blob (first fadeContainer child)
-        self._paste(rgb, self._shadow, cx, cy, alpha)
+        # 1) shadow blob (first fadeContainer child). skip_shadow=True means
+        #    gl_shadow_sprite() already drew it in the GL pass this frame.
+        if not skip_shadow:
+            self._paste(rgb, self._shadow, cx, cy, alpha)
 
         # 2) progress bar: container width 0 -> 0.3 (OutQuint, 325ms), snap
         #    to 0 at t'=D; pill width rides the damped fraction
