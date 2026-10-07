@@ -76,11 +76,14 @@ def test_probe_agrees_with_a_whole_frame():
     assert gl.ffmpeg_matches_twin() == whole
 
 
-def test_off_unless_asked_and_off_where_ffmpeg_differs():
-    if os.environ.get("R3D_TAIKO_GPU_YUV") is None:
+def test_off_unless_wanted_and_off_where_ffmpeg_differs():
+    import osu_taiko_renderer.render.envflag as sw
+    if not sw.GPU_YUV:                       # not asked for and not this platform's default
         assert gl._GPU_YUV is False
-    if not gl.ffmpeg_matches_twin():
+    if not gl.ffmpeg_matches_twin():         # wanted or not: this ffmpeg converts differently
         assert gl._GPU_YUV is False
+    if sw.GPU_YUV and gl.ffmpeg_matches_twin():
+        assert gl._GPU_YUV is True
 
 
 def test_twin_equals_ffmpeg_on_every_sample():
@@ -242,6 +245,66 @@ def test_zero_means_off_and_every_module_reads_the_same_answer():
         e.update(env)
         subprocess.run([sys.executable, "-c", code], env=e, check=True,
                        cwd=str(Path(__file__).resolve().parents[1]))
+
+
+def _main_under(rc=None, raises=None, any_fast=False):
+    """Run the package's __main__ with the CLI and the re-exec stubbed.
+    Returns (exit code or "re-run", the environment a re-run was started with)."""
+    import runpy
+    import osu_taiko_renderer.render.envflag as sw
+    from osu_taiko_renderer import cli
+    saved = (cli.main, os.execve, sw.ANY_FAST)
+    reran = []
+
+    class _Reexec(Exception):
+        pass
+
+    def fake_main():
+        if raises is not None:
+            raise raises
+        return rc
+
+    def fake_execve(exe, argv, env):
+        reran.append((argv, env))
+        raise _Reexec()
+    cli.main, os.execve, sw.ANY_FAST = fake_main, fake_execve, any_fast
+    code = None
+    try:
+        try:
+            runpy.run_module("osu_taiko_renderer", run_name="__main__")
+        except SystemExit as e:
+            code = e.code
+        except _Reexec:
+            code = "re-run"
+    finally:
+        cli.main, os.execve, sw.ANY_FAST = saved
+    return code, (reran[0] if reran else None)
+
+
+def test_a_render_that_fails_with_a_switch_on_is_run_again_on_the_stock_path():
+    code, rerun = _main_under(raises=RuntimeError("GL error"), any_fast=True)
+    assert code == "re-run" and rerun[1]["R3D_TAIKO_STOCK"] == "1"
+    assert rerun[0][1:3] == ["-m", "osu_taiko_renderer"]
+    assert _main_under(rc=1, any_fast=True)[0] == "re-run"
+    assert _main_under(raises=SystemExit(3), any_fast=True)[0] == "re-run"
+    # and the re-run cannot loop: with R3D_TAIKO_STOCK=1 nothing counts as a switch
+    r = _resolved(dict(_ALL_ON, R3D_TAIKO_STOCK="1"))
+    assert not any(r.values())
+
+
+def test_nothing_else_is_run_again():
+    assert _main_under(rc=0, any_fast=True) == (0, None)             # it worked
+    assert _main_under(rc=2, any_fast=False) == (2, None)            # the stock path's own failure
+    try:
+        _main_under(raises=RuntimeError("x"), any_fast=False)        # ... and its exception is not swallowed
+        raise AssertionError("expected the exception")
+    except RuntimeError:
+        pass
+    try:
+        _main_under(raises=KeyboardInterrupt(), any_fast=True)       # a cancelled job is not re-run
+        raise AssertionError("expected KeyboardInterrupt")
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

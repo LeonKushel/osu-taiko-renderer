@@ -60,3 +60,8 @@ GPU_YUV = _fast("R3D_TAIKO_GPU_YUV")      # asked for; gl.py checks the local ff
 # per-sprite path on taiko's short runs, and an additive sprite's fractional
 # alpha lands one level apart as a vertex attribute (4 frames of the fixture).
 INSTANCED = envflag("R3D_TAIKO_INSTANCED") and not STOCK
+
+# Is anything other than the stock render path in use? __main__ runs a render
+# that failed with any of these on again on the stock path.
+ANY_FAST = any((GPU_FX, GPU_FL, GPU_NUM, GPU_HUD, GPU_BREAK, MERGE_RUNS, ROUND,
+                MAP_READBACK, SOCKET_PIPE, RESULTS_AHEAD, GPU_YUV, INSTANCED))
