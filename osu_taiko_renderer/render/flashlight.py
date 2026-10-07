@@ -46,6 +46,25 @@ def _out_quint(p: float) -> float:
     return 1.0 - q * q * q * q * q
 
 
+import os as _os_fl
+from osu_taiko_renderer.render.envflag import envflag
+
+# R3D_TAIKO_ROUND: round-to-nearest on the 8-bit store instead of truncating.
+# This module was MISSED when that flag landed -- like hud/break_overlay.py, it
+# still ended in a bare `.astype(np.uint8)`. Consequences:
+#   * truncation is a BIASED estimator, losing on average half a level on every
+#     blended pixel, so the whole flashlight vignette renders systematically DARK;
+#   * it made the GL flashlight quad look wrong when it was not. Measured on two
+#     REAL corpus FL replays: 6.66%% and 9.90%% of pixels differing, +1 on EVERY
+#     one of 3,850,533 and 5,622,441 channel values, never -1 and never >1.
+# catch's equivalent (render/flashlight.py:162) already uses np.rint, which is why
+# its GPU port measured max|d|=1 over only 0.0001%% of pixels.
+from osu_taiko_renderer.render.envflag import ROUND as _ROUND_FL  # noqa: E402
+# R3D_TAIKO_GPU_FL: draw the spotlight as one GL multiply-blend quad inside
+# the main pass instead of a CPU full-frame pass after readback.
+from osu_taiko_renderer.render.envflag import GPU_FL as _GPU_FL  # noqa: E402
+
+
 class TaikoFlashlight:
     """Per-render flashlight overlay. Construct once; call composite() per
     gameplay frame with the frame RGB and its map time."""
@@ -70,6 +89,7 @@ class TaikoFlashlight:
         self._tl = tl
         self._tl_t = [b[0] for b in tl]
         self._ramp_cache: dict[int, np.ndarray] = {}
+        self._keep_cache: dict[int, np.ndarray] = {}   # ri -> (1 - alpha) f32
 
     def _scale_at(self, t: float) -> float:
         i = bisect.bisect_right(self._tl_t, t) - 1
@@ -99,11 +119,64 @@ class TaikoFlashlight:
             self._ramp_cache[ri] = alpha
         return alpha
 
+    def _keep(self, ri: int) -> np.ndarray:
+        """float32 (2ri x 2ri) of EXACTLY the multiplier composite() applies,
+        i.e. `1.0 - alpha`, cached by integer radius.
+
+        This exists so the GPU can SAMPLE the CPU's own numbers instead of
+        recomputing the falloff in GLSL. Recomputing is where the residual came
+        from: the shader and numpy evaluate the same smoothstep with different
+        float32 instruction orderings and disagreed on ~25 channel values per
+        frame. Sampling makes `keep` bit-identical by construction.
+
+        Only possible because taiko quantises `ri` to an INT, so the set of ramps
+        is enumerable and cacheable. catch cannot do this -- its radius is a
+        continuous float through the 800 ms combo ramp.
+        """
+        hit = self._keep_cache.get(ri)
+        if hit is None:
+            hit = (1.0 - self._ramp(ri)).astype(np.float32)
+            if len(self._keep_cache) >= 4:
+                self._keep_cache.clear()      # bounded: 2ri x 2ri x 4 B each
+            self._keep_cache[ri] = hit
+        return hit
+
+    def gl_keep_params(self, t: float):
+        """(x0, y0, n, keep) for the BYTE-EXACT GL path, or None when off.
+
+        x0/y0 reproduce composite()'s integer placement exactly:
+        `cx = int(round(self.cx))`, then `x0 = cx - ri`.
+        """
+        if not self.on:
+            return None
+        ri = int(round(self.base_r * self._scale_at(t)))
+        if ri < 1:
+            return None
+        cx, cy = int(round(self.cx)), int(round(self.cy))
+        return (cx - ri, cy - ri, 2 * ri, self._keep(ri))
+
+    def gl_params(self, t: float):
+        """(cx, cy, ri, core) for the GL multiply-blend pass, or None when the
+        flashlight is off or the disc has collapsed. `ri` is quantised to an int
+        exactly as composite() does, so the GPU evaluates the same falloff the CPU
+        ramp was built from — the ramp is cached BY integer radius, so any other
+        rounding would sample a different curve."""
+        if not self.on:
+            return None
+        ri = int(round(self.base_r * self._scale_at(t)))
+        if ri < 1:
+            return None                      # caller blacks the frame instead
+        return (self.cx, self.cy, ri, _CORE)
+
+    def cpu_work(self) -> bool:
+        """Does composite() change frames in this render?"""
+        return self.on and not _GPU_FL
+
     def composite(self, frame: np.ndarray, t: float) -> np.ndarray:
         """Return `frame` (HxWx3 uint8) darkened to the flashlight spotlight:
         solid black except the lit disc at the hit target. Never mutates the
         input (safe on read-only arrays). No-op (returns frame) when FL is off."""
-        if not self.on:
+        if not self.on or _GPU_FL:
             return frame
         ri = int(round(self.base_r * self._scale_at(t)))
         if ri < 1:
@@ -116,9 +189,12 @@ class TaikoFlashlight:
         fx0, fy0 = max(0, x0), max(0, y0)
         fx1, fy1 = min(w, cx + ri), min(h, cy + ri)
         out = np.zeros_like(frame)
+        if out.shape[2] == 4:
+            out[..., 3] = 255      # RGBA chain: black, not transparent-black
         if fx1 <= fx0 or fy1 <= fy0:
             return out                       # disc entirely off-screen -> black
         a = ramp[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0][..., None]
-        src = frame[fy0:fy1, fx0:fx1].astype(np.float32) * (1.0 - a)
-        out[fy0:fy1, fx0:fx1] = src.astype(np.uint8)
+        src = frame[fy0:fy1, fx0:fx1, :3].astype(np.float32) * (1.0 - a)
+        out[fy0:fy1, fx0:fx1, :3] = (np.rint(src).astype(np.uint8) if _ROUND_FL
+                                 else src.astype(np.uint8))
         return out

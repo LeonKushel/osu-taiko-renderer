@@ -60,6 +60,21 @@ from osu_taiko_renderer.hud.lb_cards import (DB_PATH, RESULT_COLORS as RC,
 UH = 1080.0                    # virtual design height (std convention)
 
 # --- timeline (ms from results start) — std lazer_results values ---------------------
+# R3D_TAIKO_RESULTS_COUNT=1: how many results frames take the FULL composite vs the
+# settled cache. Decides whether a GPU port would help ~200 frames or ~318.
+_RF_COUNT = None
+if __import__("os").environ.get("R3D_TAIKO_RESULTS_COUNT"):
+    _RF_COUNT = {}
+    import atexit as _rf_atx
+
+    @_rf_atx.register
+    def _rf_dump():
+        import sys as _s
+        c = _RF_COUNT.get("calls", 0); h = _RF_COUNT.get("cached", 0)
+        print(f"[results-count] render_frame calls={c} cache_hits={h} "
+              f"full_composites={c - h}", file=_s.stderr, flush=True)
+
+
 FADE_MS = 320.0                # panel opacity ramp
 SWEEP_DELAY_MS = 260.0         # accuracy arc sweep start
 SWEEP_MS = 1150.0              # AccuracyCircle ACCURACY_TRANSFORM_DURATION (scaled)
@@ -1088,7 +1103,7 @@ class CatchLazerResults:
         self._score_img = img
         self._score_val = value
 
-    def prebake_anim(self, schedule) -> None:
+    def prebake_anim(self, schedule, on_ready=None) -> None:
         """Pre-bake the deterministic animation assets for the outro frame
         `schedule` (list of (opacity, age_ms) pairs exactly as the render
         loop will call render_frame). Meant to run on a BACKGROUND thread
@@ -1106,7 +1121,7 @@ class CatchLazerResults:
             stage2 = bool(getattr(self, "_stage2", False))
             if stage2:
                 pw, ph = self.stats_panel_img.size
-            for op, age_ms in schedule:
+            for _k_sched, (op, age_ms) in enumerate(schedule):
                 op = _clamp01(op)
                 fade = _clamp01(age_ms / FADE_MS) * op
                 if fade <= 0.003:
@@ -1139,6 +1154,13 @@ class CatchLazerResults:
                             self._panel_wcache[dw] = \
                                 self.stats_panel_img.resize((dw, ph),
                                                             Image.BILINEAR)
+                # This frame's assets are now baked, so it can be COMPOSITED
+                # immediately instead of waiting for the whole schedule to finish.
+                # Called on this thread on purpose: render_frame mutates _settled and
+                # _black_base, and the caches above are plain dicts -- a second thread
+                # would race both.
+                if on_ready is not None:
+                    on_ready(_k_sched, op, age_ms)
         except Exception as e:  # noqa: BLE001 -- prebake never breaks results
             import sys
             print(f"[taiko-renderer] results prebake stopped early: {e}",
@@ -1277,7 +1299,11 @@ class CatchLazerResults:
         anim_done_ms = min(SETTLE_MS,
                            STAGE1_MS + 120.0 + 2 * STAGGER_MS + OPEN_MS)
         settled = op >= 0.999 and age_ms >= anim_done_ms
+        if _RF_COUNT is not None:
+            _RF_COUNT["calls"] = _RF_COUNT.get("calls", 0) + 1
         if settled and self._settled is not None:
+            if _RF_COUNT is not None:
+                _RF_COUNT["cached"] = _RF_COUNT.get("cached", 0) + 1
             return self._settled
 
         wash_a = int(op * 255)

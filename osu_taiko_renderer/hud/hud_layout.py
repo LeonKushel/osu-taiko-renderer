@@ -38,7 +38,9 @@ REF_H = 1080.0   # lazer skins are near-universally laid out at 1080p
 
 class SkinHudLayout:
     def __init__(self, skin_dir):
-        self.elems = {}
+        # Annotated for mypyc: an un-annotated empty dict infers as
+        # dict[<nothing>, <nothing>] and every later insertion is a type error.
+        self.elems: dict = {}
         if not skin_dir:
             return
         p = Path(skin_dir) / "MainHUDComponents.json"

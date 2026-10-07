@@ -132,6 +132,12 @@ class ReplayMeta:
     # meaningful for lazer-format replays (game_version >= 30_000_000); stable
     # .osr files can't encode CL and are always treated as stable anyway.
     is_classic: bool = False
+    # When the play actually happened, straight off the .osr (osrparse exposes it
+    # as a tz-aware datetime). The results card used to fall back to
+    # datetime.now(), which both mislabelled every replay with the RENDER date
+    # and made the outro nondeterministic run-to-run — the play timestamp is
+    # already in the file, it was just being skipped.
+    timestamp: object = None
     # ((time_ms, life 0..1), …) from the .osr life-bar graph, if the replay
     # carries one (stable replays usually do; lazer/API ones often don't).
     life_bar: tuple = ()

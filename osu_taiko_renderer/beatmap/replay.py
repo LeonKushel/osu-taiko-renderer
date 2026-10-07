@@ -265,6 +265,7 @@ def parse_replay(path: Path) -> tuple[list[TaikoFrame], ReplayMeta]:
         grade=_grade(acc, r),
         game_version=int(getattr(r, "game_version", 0) or 0),
         is_classic=_detect_classic(path, int(getattr(r, "game_version", 0) or 0)),
+        timestamp=getattr(r, "timestamp", None),
         life_bar=life_bar,
         replay_end_ms=replay_end_ms,
     )

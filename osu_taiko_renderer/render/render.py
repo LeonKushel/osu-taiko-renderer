@@ -25,9 +25,13 @@ from osu_taiko_renderer.skin.assets import build_textures
 from osu_taiko_renderer.beatmap.beatmap import parse_beatmap
 from osu_taiko_renderer.render.gl import SpriteRenderer
 from osu_taiko_renderer.render import preview_hw as _phw
+from osu_taiko_renderer.render.gl import _GPU_YUV as _GPU_YUV_R
+from osu_taiko_renderer.render.gl import rgb_to_yuv420p as _rgb_to_yuv420p
 from osu_taiko_renderer.beatmap.models import RenderConfig
 from osu_taiko_renderer.beatmap.replay import parse_replay
 from osu_taiko_renderer.render.scene import TaikoSim
+from osu_taiko_renderer.render.envflag import envflag
+import osu_taiko_renderer.render.envflag as _sw
 
 log = logging.getLogger(__name__)
 
@@ -115,9 +119,11 @@ def render_taiko(
     progress_callback=None,
 ) -> Path:
     cfg = cfg or RenderConfig()
+    _mark("entry")
     frames, meta = parse_replay(osr_path)
     osu_path = _find_osu(beatmap_dir, meta.beatmap_md5)
     bm = parse_beatmap(osu_path, mods=meta.mods)
+    _mark("parse_replay+beatmap")
     if not bm.objects:
         raise TaikoRenderError(f"no hit objects parsed from {osu_path.name}")
     audio = bm.audio_filename and (beatmap_dir / bm.audio_filename)
@@ -202,6 +208,69 @@ def _build_storyboard(cfg, renderer, osu_path, w, h):
         return None
 
 
+_PERF = os.environ.get("R3D_TAIKO_PERF")
+_STAGE = os.environ.get("R3D_TAIKO_STAGE")
+# R3D_TAIKO_OUTRO_CPROF=1: cProfile ONLY the results-screen composite.
+# Wrapped around the call rather than the process because a top-level profile drowns
+# it in 1758 gameplay frames, and the outro is only ~318 frames of a different shape.
+_OUTRO_CPROF = envflag("R3D_TAIKO_OUTRO_CPROF")
+if _OUTRO_CPROF:
+    import atexit as _ocp_atx
+    import cProfile as _ocp_mod
+    import io as _ocp_io
+    import pstats as _ocp_pstats
+
+    _OCP = _ocp_mod.Profile()
+
+    @_ocp_atx.register
+    def _ocp_dump():
+        import sys as _o
+        buf = _ocp_io.StringIO()
+        _ocp_pstats.Stats(_OCP, stream=buf).sort_stats("tottime").print_stats(30)
+        print("[outro-cprof] results composite only:", file=_o.stderr)
+        print(buf.getvalue(), file=_o.stderr, flush=True)
+
+
+_dump_env = os.environ.get("R3D_TAIKO_DUMP")
+_DUMP = None
+if _dump_env:
+    _parts = _dump_env.split(",")
+    _DUMP = (_parts[0], {int(x): True for x in _parts[1:]})
+_ST: dict = {}
+# HARNESS: R3D_TAIKO_SBPROF=1 splits stage buckets that enclose more than their
+# name suggests. THREE of this session's buckets lied: `hud`=0.000 (the work had
+# moved into sprite_build), `gl_draw` (its window enclosed overlay_gl), and
+# `sb_fx` (93% of it was sim.active_effects, not sprite building at all).
+# A stage bucket measures a WINDOW, not a function -- split before optimising.
+_SBPROF = envflag("R3D_TAIKO_SBPROF")
+_SB = {"hud_gl": 0.0, "fl_params": 0.0, "n": 0}
+if _SBPROF:
+    import atexit as _sb_atx
+
+    @_sb_atx.register
+    def _sb_dump():
+        import sys as _sb
+        n = max(1, _SB["n"])
+        print(f"[sb-prof] sprite_build split over {n} frames: "
+              f"hud.overlay_gl={_SB['hud_gl']/n*1e3:.4f} ms  "
+              f"flashlight_params={_SB['fl_params']/n*1e3:.4f} ms",
+              file=_sb.stderr, flush=True)
+
+
+def _acc(k, dt):
+    _ST[k] = _ST.get(k, 0.0) + dt
+_MARKS: list = []
+
+
+def _mark(label: str) -> None:
+    """HARNESS: R3D_TAIKO_PERF=1 stamps a wall mark. Printed as a phase table at
+    the end, so the PROLOGUE and the encoder tail are visible -- taiko's printed
+    `done: N frames in Xs` starts AFTER setup and ends AFTER proc.wait(), which
+    is what let a contaminated run read as a 515s serial tail."""
+    if _PERF:
+        _MARKS.append((label, time.monotonic()))
+
+
 def render_core(
     bm,
     frames,
@@ -222,6 +291,7 @@ def render_core(
     # Phase 1: procedural taiko textures + simple HUD (no skin asset wiring yet).
     skin = None
     sim = TaikoSim(bm, frames, cfg, skin=skin, has_bg=bg is not None, meta=meta)
+    _mark("sim_built")
     if cfg.show_pp_counter and osu_path is not None:
         sim.compute_pp_curve(osu_path, meta.mods)
     # --pp: pin the FINAL pp (results card + live-counter endpoint) to the EXACT
@@ -354,6 +424,7 @@ def render_core(
     else:
         for key, rgba in build_textures(cfg.skin_dir).items():
             renderer.upload_texture(key, rgba)
+    _mark("skin_textures_uploaded")
     from osu_taiko_renderer.skin.assets import bake_logo_tile, logo_glow_rgba
     renderer.upload_texture("logo_tile", bake_logo_tile())
     renderer.upload_texture("logo_glow", logo_glow_rgba())
@@ -365,7 +436,9 @@ def render_core(
     # Storyboard renderer (phase 4/5): constructed only when --storyboard is on
     # (see below). While None, the frame loop takes the exact single-draw path
     # it always has, so live renders are byte-identical.
+    _mark("bg_tex")
     storyboard = _build_storyboard(cfg, renderer, osu_path, w, h)
+    _mark("storyboard")
 
     total_dur_s = n_frames / cfg.fps
     # Per-note hitsound dub (taiko previously rendered music-only). Built from
@@ -391,6 +464,8 @@ def render_core(
             print(f"[taiko-renderer] hitsound build skipped: {_e}", file=sys.stderr)
             hitsound = None
     is_nc = bool(int(getattr(meta, "mods", 0) or 0) & 512)   # Nightcore bit
+    _mark("hitsounds")
+    _mark("assets_done")
     # INLINE PREVIEW (R3D_PREVIEW_INLINE=1, default OFF): have the SAME ffmpeg
     # that encodes the master also write the lean 720p30 preview embed as a
     # second output, so it is finished the moment the render is. Without it the
@@ -454,9 +529,10 @@ def render_core(
     # an 800ms OutQuint fade. Composited OVER the playfield but UNDER the HUD
     # (both HUD variants) so score/combo/health stay visible. No-op without FL.
     from osu_taiko_renderer.render.flashlight import TaikoFlashlight
+    _fl_mods = int(getattr(meta, "mods", 0) or 0)
     flashlight = TaikoFlashlight(
         sim.geo, getattr(sim, "_rt", None), getattr(sim, "_cum", None),
-        int(getattr(meta, "mods", 0) or 0))
+        _fl_mods)
     from osu_taiko_renderer.argon.compositor import ArgonEffects, bloom as _bloom
     effects = ArgonEffects(sim.geo, cfg.skin_dir)
 
@@ -510,6 +586,24 @@ def render_core(
     if cfg.show_results and outro_frames > 0:
         _pre_evt = threading.Event()
         _lazer_results_cache["evt"] = _pre_evt
+        # R3D_TAIKO_RESULTS_AHEAD: composite the results frames DURING GAMEPLAY on the
+        # prebake thread, so the outro becomes a dequeue instead of ~11 ms of PIL per
+        # frame (measured: 202 full composites, a FIXED ~2.2 s per render regardless of
+        # map length).
+        #
+        # Safe because past the fade (op >= 0.999, i.e. 320 ms in) `render_frame` takes
+        # its `wash_a >= 255` branch and NEVER READS the background frame -- it starts
+        # from cached opaque black, so the output depends only on age_ms, which is
+        # deterministic from the frame index. Frames before that still need the real
+        # last-gameplay frame and stay inline.
+        #
+        # ONE producer, not N: render_frame mutates self._settled and self._black_base,
+        # so concurrent callers would race. One is enough -- it produces at ~11 ms/frame
+        # against a 16.7 ms/frame consumer.
+        _RES_AHEAD = _sw.RESULTS_AHEAD
+        _res_ready: dict = {}
+        _res_cv = threading.Condition()
+        _RES_MAX = int(os.environ.get("R3D_TAIKO_RESULTS_AHEAD_MAX", "32"))
 
         def _prebuild_results() -> None:
             try:
@@ -517,14 +611,34 @@ def render_core(
                 scr = CatchLazerResults((w, h), meta, bm, board=baked_board,
                                         osu_path=osu_path, sim=sim)
                 _lazer_results_cache["pre"] = scr
-                _pre_evt.set()           # publish the instance first…
+                _pre_evt.set()           # ORIGINAL: publish first
                 sched = []
+                sched_idx = []
                 for _i in range(gameplay_frames, n_frames):
                     _t = int(gameplay_end_ms + (_i - gameplay_frames) * frame_ms)
                     if _t >= results_start_ms:
                         _op = min(1.0, (_t - results_start_ms) / FADE_MS)
-                        sched.append((_op, float(_t - results_start_ms)))
-                scr.prebake_anim(sched)  # …then keep baking in the background
+                        _age = float(_t - results_start_ms)
+                        sched.append((_op, _age))
+                        sched_idx.append((_i, _op, _age))
+                # INTERLEAVED: compose each results frame the moment ITS assets are
+                # baked, rather than waiting for the whole schedule. Producing after
+                # prebake_anim returned capped the win at +5% purely because the
+                # producer had almost no runway left on a short map.
+                _shape = np.zeros((h, w, 3), np.uint8) if _RES_AHEAD else None
+
+                def _on_ready(_k, _op, _age):
+                    if not _RES_AHEAD or _op < 0.999:
+                        return                # needs the real background; stays inline
+                    _idx = sched_idx[_k][0]
+                    _f = scr.render_frame(_shape, _op, _age)
+                    with _res_cv:
+                        while len(_res_ready) >= _RES_MAX:
+                            _res_cv.wait(0.5)
+                        _res_ready[_idx] = _f
+                        _res_cv.notify_all()
+
+                scr.prebake_anim(sched, on_ready=_on_ready if _RES_AHEAD else None)
             except Exception as _e:  # noqa: BLE001 — never break a render
                 print(f"[taiko-renderer] results prebuild skipped: {_e}",
                       file=sys.stderr)
@@ -547,6 +661,38 @@ def render_core(
     #   * The ffmpeg pipe write (tobytes + stdin.write) happens on a writer
     #     thread behind a small bounded queue (_FrameWriter).
     # Frame count, order and bytes are identical to the synchronous path.
+    # R3D_TAIKO_GPU_FX: register the prebaked effect textures with GL once, so
+    # the drum flashes / hit explosions can be drawn as additive sprites inside
+    # the existing pass (before readback) instead of composited on the CPU after.
+    # (the GPU switches depend on each other; render/envflag.py resolves them)
+    _GPU_FX = _sw.GPU_FX
+    _GPU_FL = _sw.GPU_FL
+    # R3D_TAIKO_GPU_HUD: run the WHOLE HUD as GL sprites (hud.overlay_gl).
+    # Requires GPU_FX (needs the sprite plumbing) and, when FL is on, GPU_FL.
+    _GPU_HUD = _sw.GPU_HUD
+    _GPU_FINISH = envflag("R3D_TAIKO_GPU_FINISH")
+    # R3D_TAIKO_FL_EXACT: draw the flashlight by SAMPLING the CPU's own
+    # (1 - alpha) ramp as an R32F texture instead of recomputing the smoothstep
+    # in GLSL. Removes the last ~25 channel values of +-1 difference, making the
+    # GPU flashlight BYTE-IDENTICAL to composite(). Needs GPU_FL.
+    _FL_EXACT = _sw.FL_EXACT
+    # R3D_TAIKO_GPU_BREAK: draw the break overlay's SHADOW as a GL sprite in the
+    # main pass instead of compositing it on the CPU after readback. Only the
+    # shadow: it is the overlay's bottom element, so moving it keeps the stacking
+    # identical (HUD < shadow < rest-of-break) while the rest still composites on
+    # the CPU on top. It is also 622k of the overlay's ~1.13M pixels at 1080p.
+    #
+    # Needs the GPU HUD, and needs it to have SUCCEEDED this frame: if overlay_gl
+    # overflowed and the HUD fell back to the CPU, a GL shadow would land UNDER
+    # that CPU HUD instead of over it.
+    _GPU_BREAK = _sw.GPU_BREAK
+    if _GPU_FX:
+        for _k, _im in effects.gpu_fx_textures().items():
+            renderer.upload_texture(_k, _im)
+        # judgement ring/popup textures are baked lazily at their exact integer
+        # sizes on first use, so the compositor needs the GL handle
+        effects.bind_gl(renderer)
+    _mark("setup_done/loop_start")
     _t_render0 = time.monotonic()
     writer = _FrameWriter(proc)
     pending = deque()   # (scene, exps, judges, drum_flashes) awaiting pixels
@@ -557,33 +703,95 @@ def render_core(
     _score_samples: list | None = (
         [] if getattr(cfg, "score_json_path", None) else None)
 
-    def _emit_gameplay(raw):
-        nonlocal last_gameplay
-        p_scene, p_exps, p_judges, p_drums = pending.popleft()
+    _yuv_cpu_frames = 0
+    _yuv_last_rgb = None    # the last gameplay frame's RGB, if the CPU finished it
+
+    def _cpu_chain(raw, p_scene, p_exps, p_judges, p_drums, p_hud_gpu, p_brk_gpu):
+        """Everything that is composited on the CPU after readback, in lazer's
+        z-order. Each stage is a no-op when its switch moved it into the GL pass."""
         # hud_opacity 0 suppresses the GREAT/OK/MISS judgement-text popups
         # (p_judges) too — the YT overlay owns judgement display. Hit
         # explosions (p_exps) + drum flashes (p_drums) stay = gameplay.
+        _c = time.perf_counter if _STAGE else None
+        _a = _c() if _c else 0
         out = effects.composite(
             raw, p_exps, p_judges if cfg.hud_opacity > 0.0 else [], p_drums)
+        if _c: _b = _c(); _acc("effects", _b - _a); _a = _b
         out = flashlight.composite(out, p_scene.time_ms)
-        if cfg.hud_opacity > 0.0:
+        if _c: _b = _c(); _acc("flashlight", _b - _a); _a = _b
+        if cfg.hud_opacity > 0.0 and not p_hud_gpu:
             out = hud.overlay(out, p_scene)
+        if _c: _b = _c(); _acc("hud", _b - _a); _a = _b
         # lazer z-order: BreakOverlay is a LATER overlay-component child
         # than HUDOverlay (Player.createOverlayComponents) — composited
         # ABOVE every HUD element, both HUD variants. Live accuracy from
         # the sim's running scene value (bound like lazer's bindable).
         # Cheap no-op outside break windows (frame bytes untouched).
         if cfg.hud_opacity > 0.0:
-            break_overlay.draw(out, p_scene.time_ms, p_scene.accuracy)
+            break_overlay.draw(out, p_scene.time_ms, p_scene.accuracy,
+                               skip_shadow=p_brk_gpu)
+        if _c: _b = _c(); _acc("break_overlay", _b - _a)
+        return out
+
+    def _yuv_needs_cpu(p_scene, p_exps, p_judges, p_drums, p_hud_gpu):
+        """Under R3D_TAIKO_GPU_YUV: would the CPU chain change THIS frame? Then it
+        cannot leave the GPU as finished yuv420p; it takes the slow road instead
+        (read RGB, composite, convert that). Which frames those are depends on
+        the other switches: with none of them, every frame; with all of them,
+        only the frames of a break (the overlay's text and bar are CPU-drawn)
+        and any frame whose HUD overflowed its reserved texture."""
+        hud_on = cfg.hud_opacity > 0.0
+        return (effects.cpu_work(p_exps, p_judges if hud_on else (), p_drums)
+                or flashlight.cpu_work()
+                or (hud_on and not p_hud_gpu)
+                or (hud_on and break_overlay.will_draw(p_scene.time_ms)))
+
+    def _emit_gameplay(raw):
+        nonlocal last_gameplay
+        (p_scene, p_exps, p_judges, p_drums, p_hud_gpu,
+         p_brk_gpu) = pending.popleft()
+        if _GPU_YUV_R:
+            # `raw` is finished planar yuv420p: either straight off the GPU, or a
+            # frame that needed the CPU chain and was composited BEFORE it was
+            # converted and queued (see the frame loop). Nothing is left to do.
+            if _DUMP is not None:
+                _di = _DUMP[1].get(getattr(_emit_gameplay, "n", 0))
+                _emit_gameplay.n = getattr(_emit_gameplay, "n", 0) + 1
+                if _di is not None:
+                    import numpy as _np
+                    _np.save(f"{_DUMP[0]}/f{_emit_gameplay.n - 1:06d}.npy", raw)
+            # last_gameplay stays None: the outro needs an RGB frame to composite
+            # the results card onto, and falls back to renderer.read_rgb() for it.
+            _pa = time.perf_counter() if _STAGE else 0
+            writer.push(raw)
+            if _STAGE:
+                _acc("push", time.perf_counter() - _pa); _acc("n", 1)
+            return
+        _c = time.perf_counter if _STAGE else None
+        out = _cpu_chain(raw, p_scene, p_exps, p_judges, p_drums, p_hud_gpu,
+                         p_brk_gpu)
+        _a = _c() if _c else 0
+        # HARNESS: R3D_TAIKO_DUMP=dir,i0,i1,... writes the RAW composited frame
+        # (pre-encode) so two runs can be compared exactly, without x264 noise.
+        if _DUMP is not None:
+            _di = _DUMP[1].get(_emit_gameplay.n if hasattr(_emit_gameplay, "n") else 0)
+            _emit_gameplay.n = getattr(_emit_gameplay, "n", 0) + 1
+            if _di is not None:
+                import numpy as _np
+                _np.save(f"{_DUMP[0]}/f{_emit_gameplay.n - 1:06d}.npy", out)
         last_gameplay = out
         writer.push(out)
+        if _c: _acc("push", _c() - _a); _acc("n", 1)
 
     try:
         try:
             for i in range(n_frames):
                 if i < gameplay_frames:
                     t = int(start_ms + i * map_step)
+                    _c2 = time.perf_counter if _STAGE else None
+                    _p = _c2() if _c2 else 0
                     scene = sim.build_scene(t)
+                    if _c2: _q = _c2(); _acc("build_scene", _q - _p); _p = _q
                     if _score_samples is not None:
                         _score_samples.append({
                             "t_ms": int(t),
@@ -591,7 +799,66 @@ def render_core(
                             "combo": int(scene.combo),
                             "acc": round(float(scene.accuracy), 6),
                         })
+                    # GPU_FX needs exps/drums BEFORE the draw call. Both are
+                    # pure functions of `t` over precomputed sim state, so
+                    # hoisting them changes nothing but the call order.
+                    _hud_gl_ok = False       # also read by the plain path below
+                    if _GPU_FX:
+                        exps, judges = sim.active_effects(t)
+                        _drums = sim.drum_flashes(t)
+                        # z-order, matching the CPU chain: playfield (and the
+                        # storyboard overlay), then the additive hit explosions,
+                        # then the judgement bursts (ring pieces additive, popup
+                        # text straight alpha on top). They are drawn in their OWN
+                        # ordered call after the playfield (draw_ordered below),
+                        # not appended to scene.sprites: draw() is two-phase and
+                        # must stay so for the drum press flashes in the scene.
+                        _fx = effects.gpu_fx_sprites(exps, _drums)
+                        _fx += effects.gpu_judge_sprites(judges)
+                        # The HUD numbers are drawn in a SECOND batch, after the
+                        # flashlight pass, because lazer's z-order is
+                        # playfield -> effects -> FLASHLIGHT -> HUD: the
+                        # spotlight darkens gameplay but must NOT darken the HUD.
+                        # GUARD: moving the HUD numbers into the GL pass is only
+                        # safe if the flashlight is in the pass too. lazer draws
+                        # the HUD ABOVE the flashlight; with the numbers on the
+                        # GPU but FL still on the CPU, the CPU pass runs after
+                        # readback and BLACKS THE NUMBERS OUT. Measured: HUD
+                        # pixels [255,255,255] -> [0,0,0] on an FL replay, while
+                        # a NoMod fixture shows nothing wrong at all.
+                        if _c2: _q = _c2(); _acc("sb_fx", _q - _p); _p = _q
+                        _hud_sp = []
+                        _w0 = _c2() if _SBPROF else 0
+                        if cfg.hud_opacity > 0.0 and (_GPU_FL or not flashlight.on):
+                            if _GPU_HUD:
+                                # Whole HUD as GL sprites. Returns None if any
+                                # element overflowed its reserved texture, in which
+                                # case this frame falls back to the CPU overlay
+                                # rather than dropping an element.
+                                _s = hud.overlay_gl(scene, renderer)
+                                if _s is not None:
+                                    _hud_sp, _hud_gl_ok = _s, True
+                            if not _hud_gl_ok:
+                                _hud_sp = hud.prepare_numbers(scene, renderer)
+                        if _SBPROF:
+                            _w1 = _c2()
+                            _SB["hud_gl"] += _w1 - _w0
+                            _SB["n"] += 1
+                        _fl_p = flashlight.gl_params(t) if _GPU_FL else None
+                        _fl_xp = (flashlight.gl_keep_params(t)
+                                  if _FL_EXACT else None)
+                        if _SBPROF:
+                            _SB["fl_params"] += _c2() - _w1
+                    # break-overlay shadow -> GL. Decided per frame and carried in
+                    # the pending tuple, because _emit_gameplay runs ~2 frames behind
+                    # and a shared cell would apply this frame's answer to that one.
+                    _brk_gpu = (_GPU_BREAK and _hud_gl_ok
+                                and cfg.hud_opacity > 0.0)
+                    _brk_sp = (break_overlay.gl_shadow_sprite(t, renderer)
+                               if _brk_gpu else None)
+                    if _c2: _q = _c2(); _acc("sprite_build", _q - _p); _p = _q
                     renderer.begin()
+                    if _c2: _q = _c2(); _acc("gl_begin_clear", _q - _p); _p = _q
                     if storyboard is None:
                         # exact single-draw path (byte-identical to pre-SB)
                         renderer.draw(scene.sprites)
@@ -610,17 +877,94 @@ def render_core(
                         storyboard.draw_underlay(t, b)
                         renderer.draw(scene.sprites[n:])
                         storyboard.draw_overlay(t, b)
-                    exps, judges = sim.active_effects(t)
-                    pending.append((scene, exps, judges, sim.drum_flashes(t)))
-                    raw = renderer.read_rgb_async()
+                    if _GPU_FX:
+                        # effects, above the playfield and the storyboard overlay
+                        # (where the CPU chain composites them), in strict order
+                        if _fx:
+                            renderer.draw_ordered(_fx)
+                        # FL between the two batches (see the z-order note above).
+                        if _fl_xp is not None:
+                            renderer.draw_flashlight_exact(*_fl_xp)
+                        elif _fl_p is not None:
+                            renderer.draw_flashlight(*_fl_p)
+                        elif _GPU_FL and flashlight.on:
+                            # radius collapsed: the CPU path returns an all-black
+                            # frame, so reproduce that rather than skipping.
+                            renderer.draw_flashlight(0.0, 0.0, 1, 0.0)
+                        if _hud_sp:
+                            renderer.draw(_hud_sp)
+                        # ABOVE the HUD (lazer: BreakOverlay is a later
+                        # overlay-component child than HUDOverlay), and in its own
+                        # draw so the HUD run is not split.
+                        if _brk_sp is not None:
+                            renderer.draw([_brk_sp])
+                    if _c2: _q = _c2(); _acc("gl_draw", _q - _p); _p = _q
+                    # R3D_TAIKO_GPU_FINISH: block until the GPU has actually executed,
+                    # so its time lands in its own bucket instead of hiding inside
+                    # readback_block. DIAGNOSTIC ONLY — it serialises CPU and GPU, so
+                    # total fps drops while it is on.
+                    if _GPU_FINISH:
+                        renderer.ctx.finish()
+                        if _c2: _q = _c2(); _acc("gpu_execute", _q - _p); _p = _q
+                    if not _GPU_FX:
+                        exps, judges = sim.active_effects(t)
+                        _drums = sim.drum_flashes(t)
+                    if _c2: _q = _c2(); _acc("active_effects", _q - _p); _p = _q
+                    pending.append((scene, exps, judges, _drums, _hud_gl_ok,
+                                    _brk_gpu))
+                    if _c2: _q = _c2(); _acc("drum_flashes", _q - _p); _p = _q
+                    if not _GPU_YUV_R:
+                        raw = renderer.read_rgb_async()
+                    elif _yuv_needs_cpu(scene, exps, judges, _drums, _hud_gl_ok):
+                        # read this frame back as RGB now, composite it, and put
+                        # the result through the same GPU conversion and the same
+                        # ring, so frame order holds. np.array: read_rgb hands
+                        # back a read-only view and the chain writes in place.
+                        _yuv_cpu_frames += 1
+                        _yuv_last_rgb = _cpu_chain(
+                            np.array(renderer.read_rgb()[..., :3]), scene, exps,
+                            judges, _drums, _hud_gl_ok, _brk_gpu)
+                        raw = renderer.yuv_from_rgb(_yuv_last_rgb)
+                    else:
+                        _yuv_last_rgb = None
+                        # the break overlay's bar eases every frame, in and out of
+                        # breaks; keep its clock running (it draws nothing here)
+                        if cfg.hud_opacity > 0.0:
+                            break_overlay.draw(None, scene.time_ms, scene.accuracy)
+                        raw = renderer.read_yuv_async()
+                    if _c2: _acc("readback_block", _c2() - _p)
                     if raw is not None:
                         _emit_gameplay(raw)
                 else:
                     # gameplay -> outro boundary: flush the PBO ring first so
                     # last_gameplay is the true final gameplay frame and
                     # ordering is preserved across the boundary.
-                    for raw in renderer.read_drain():
-                        _emit_gameplay(raw)
+                    #
+                    # GUARDED ON `pending`: this else-branch runs for EVERY outro
+                    # frame, not just the first. That was harmless while outro
+                    # conversion was synchronous (the ring was empty after the
+                    # boundary), but the async outro path queues INTO this same ring,
+                    # so an unguarded drain pulls outro frames back out and hands them
+                    # to _emit_gameplay, which pops an empty `pending`. `pending` is
+                    # non-empty only at the true boundary, so it is the exact latch.
+                    if pending:
+                        for raw in (renderer.read_yuv_drain() if _GPU_YUV_R
+                                    else renderer.read_drain()):
+                            _emit_gameplay(raw)
+                        if _GPU_YUV_R and last_gameplay is None:
+                            # Grab the frozen background ONCE. Under GPU_YUV the
+                            # gameplay path never produces an RGB frame (it emits
+                            # planar YUV), so last_gameplay stays None and the
+                            # `else renderer.read_rgb()` below would fire for EVERY
+                            # outro frame -- 318 full 6.2 MB readbacks of a frame
+                            # that never changes. The scene fbo still holds the final
+                            # gameplay frame at this point, which is exactly what the
+                            # outro wants as its background.
+                            # ...unless the CPU chain finished that last frame:
+                            # then the fbo holds it WITHOUT what the CPU added.
+                            last_gameplay = (_yuv_last_rgb
+                                             if _yuv_last_rgb is not None
+                                             else renderer.read_rgb())
                     # perf: materialise the frozen final gameplay frame ONCE
                     # (it was .copy()'d per outro frame). Nothing downstream
                     # mutates it — the results screen builds new arrays — so
@@ -641,16 +985,50 @@ def render_core(
                         # unfolding from the right). osu_path lets it compute
                         # stars + pp (rosu); sim feeds the COMBO panel its
                         # per-object combo series. BYPASSES hud.draw_results.
-                        rgb = _draw_lazer_results(
-                            _lazer_results_cache, rgb, meta, bm, op,
-                            age_ms=float(t - results_start_ms),
-                            board=baked_board, osu_path=osu_path, sim=sim)
-                    writer.push(rgb)
+                        _pre = None
+                        if _RES_AHEAD:
+                            with _res_cv:
+                                # drop anything the inline path already overtook, so a
+                                # producer that fell behind cannot pin the bound forever
+                                for _k in [k for k in _res_ready if k < i]:
+                                    del _res_ready[_k]
+                                _pre = _res_ready.pop(i, None)
+                                _res_cv.notify_all()
+                        if _pre is not None:
+                            rgb = _pre
+                        else:
+                            if _OUTRO_CPROF:
+                                _OCP.enable()
+                            rgb = _draw_lazer_results(
+                                _lazer_results_cache, rgb, meta, bm, op,
+                                age_ms=float(t - results_start_ms),
+                                board=baked_board, osu_path=osu_path, sim=sim)
+                            if _OUTRO_CPROF:
+                                _OCP.disable()
+                    # outro frames are CPU-composited RGB and never touch the
+                    # scene texture, so they convert on the CPU -- bit-identical
+                    # to the shader (both verified max|d|=0 vs swscale).
+                    if _GPU_YUV_R:
+                        # async now: None while the ring fills, drained after the loop
+                        _y = renderer.yuv_from_rgb(rgb)
+                        if _y is not None:
+                            writer.push(_y)
+                    else:
+                        writer.push(rgb)
                 if progress_callback and i % cfg.fps == 0:
                     progress_callback(int(i / n_frames * 100))
-            # map end with no outro configured: flush the ring tail.
-            for raw in renderer.read_drain():
-                _emit_gameplay(raw)
+
+            # Map end: flush whatever is still in the ring. GAMEPLAY frames still have a
+            # `pending` entry and must go through _emit_gameplay; OUTRO frames have none
+            # and are already finished buffers, so they go straight to the writer.
+            # Routing on `pending` keeps ONE drain correct for both -- draining an outro
+            # frame through _emit_gameplay would popleft an empty deque.
+            for raw in (renderer.read_yuv_drain() if _GPU_YUV_R
+                        else renderer.read_drain()):
+                if pending:
+                    _emit_gameplay(raw)
+                else:
+                    writer.push(raw)
         except BrokenPipeError:
             pass               # ffmpeg died — surfaced via ret below
     finally:
@@ -660,10 +1038,35 @@ def render_core(
                 proc.stdin.close()
             except BrokenPipeError:
                 pass
+        _mark("loop_end+drain")
         ret = proc.wait()
+        _mark("ffmpeg_done")
         renderer.release()
         import sys as _rsys
         _wall = time.monotonic() - _t_render0
+        if _GPU_YUV_R and _yuv_cpu_frames:
+            print(f"[taiko-renderer] GPU colour conversion: {_yuv_cpu_frames} of "
+                  f"{gameplay_frames} gameplay frames needed CPU compositing "
+                  f"and took the slow path", file=sys.stderr)
+        if _STAGE and _ST.get("n"):
+            _nf = _ST.pop("n")
+            print(f"[taiko-stage] per-frame ms over {int(_nf)} composited "
+                  f"frames:", file=sys.stderr)
+            for _k, _v in sorted(_ST.items(), key=lambda kv: -kv[1]):
+                print(f"[taiko-stage]   {_k:<16s} {_v / _nf * 1e3:7.3f}"
+                      f"   ({_v:6.1f}s total)", file=sys.stderr)
+            print(f"[taiko-stage]   {'SUM':<16s} "
+                  f"{sum(_ST.values()) / _nf * 1e3:7.3f}", file=sys.stderr)
+        if _PERF and _MARKS:
+            _t0 = _MARKS[0][1]
+            print("[taiko-perf] phase table (s):", file=sys.stderr)
+            _prev = _t0
+            for _lbl, _ts in _MARKS[1:]:
+                print(f"[taiko-perf]   {_lbl:<24s} +{_ts - _prev:7.2f}"
+                      f"   (t={_ts - _t0:7.2f})", file=sys.stderr)
+                _prev = _ts
+            print(f"[taiko-perf]   {'TOTAL from entry':<24s} "
+                  f" {_MARKS[-1][1] - _t0:7.2f}", file=sys.stderr)
         print(f"done: {n_frames} frames in {_wall:.1f}s "
               f"({(n_frames / _wall) if _wall else 0.0:.1f} fps) ret={ret}",
               file=_rsys.stderr, flush=True)
@@ -891,7 +1294,11 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
     cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error"]
     if enc == "h264_vaapi" and dev:
         cmd += ["-vaapi_device", dev]
-    cmd += ["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{w}x{h}", "-r", str(cfg.fps),
+    # GPU_YUV hands ffmpeg finished yuv420p, so swscale does NO conversion.
+    # Read the SAME flag object the readback path uses, not the env var again --
+    # they must never disagree about the pixel format or ffmpeg gets mislabelled bytes.
+    _pixfmt = "yuv420p" if _GPU_YUV_R else "rgb24"
+    cmd += ["-f", "rawvideo", "-pix_fmt", _pixfmt, "-s", f"{w}x{h}", "-r", str(cfg.fps),
             "-i", "pipe:0"]
     # Resolve the music input + its live filter chain. With the loudnorm cache
     # on, a hit feeds ffmpeg the pre-loudnorm'd PCM and drops loudnorm (+ the
@@ -1099,7 +1506,62 @@ def _spawn_ffmpeg(cfg: RenderConfig, output_path: Path, audio: Path | None,
     errf = tempfile.NamedTemporaryFile(
         prefix="catch_ffmpeg_", suffix=".log", delete=False, mode="w+",
     )
-    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errf, bufsize=0)
+    # macOS: F_SETPIPE_SZ is Linux-only, so a Mac node pushes every frame through
+    # the 64 KiB default pipe — ~95 kernel handoffs for one 6.22 MB RGB24 frame.
+    # A unix socketpair CAN be grown (SO_SNDBUF/SO_RCVBUF). Catch measured this on
+    # the same machine and the same ffmpeg line: pipe 256 fps -> socketpair
+    # 406 fps, against a 419 fps file-fed ceiling. It matters far more now than it
+    # did at 150 fps: with the composite chain on the GPU, `push` was measured at
+    # 3.9 ms/frame — the pipe, not the renderer, had become the wall.
+    # Bytes on the wire are unchanged, so output is byte-identical.
+    if _sw.SOCKET_PIPE:
+        import socket as _sock
+        _par, _chi = _sock.socketpair(_sock.AF_UNIX, _sock.SOCK_STREAM)
+        for _s, _opt in ((_par, _sock.SO_SNDBUF), (_chi, _sock.SO_RCVBUF)):
+            try:
+                _s.setsockopt(_sock.SOL_SOCKET, _opt, 1 << 20)
+            except OSError:
+                pass              # keep the default buffer; still correct
+        proc = subprocess.Popen(cmd, stdin=_chi.fileno(), stderr=errf,
+                                stdout=subprocess.DEVNULL, bufsize=0)
+        _chi.close()
+
+        class _SockStdin:
+            """File-like shim over the socket. `sendall` is deliberate: a raw
+            SocketIO.write may write PARTIALLY and return a short count, and
+            _FrameWriter ignores write()'s return value — that would silently
+            truncate a frame."""
+
+            def __init__(self, sk):
+                self._sk = sk
+
+            def write(self, b):
+                self._sk.sendall(b)
+                return len(b)
+
+            def flush(self):
+                pass
+
+            def fileno(self):
+                return self._sk.fileno()
+
+            def close(self):
+                try:
+                    self._sk.shutdown(_sock.SHUT_WR)
+                except OSError:
+                    pass
+                self._sk.close()
+
+        proc.stdin = _SockStdin(_par)
+        proc._catch_errlog = errf.name  # type: ignore[attr-defined]
+        return proc
+    proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=errf,
+                            stdout=subprocess.DEVNULL, bufsize=0)
+    try:
+        import fcntl
+        fcntl.fcntl(proc.stdin.fileno(), 1031, 1 << 20)   # F_SETPIPE_SZ (Linux)
+    except (OSError, ImportError, AttributeError):
+        pass                      # not Linux, or not permitted — default size
     proc._catch_errlog = errf.name  # type: ignore[attr-defined]
     return proc
 
