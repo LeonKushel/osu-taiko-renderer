@@ -113,14 +113,39 @@ class SkinHealthBar:
         self._bg_scaled = None
         self._col_base = None
 
+    # narrower than this is not a bar: it is the legacy "hide the scorebar" trick
+    # (ship a 1x1 placeholder). 2 of the 9 top community skins by render volume
+    # do exactly that.
+    _MIN_BG_W = 32
+
     @property
     def present(self) -> bool:
-        return self.bg is not None
+        """False when the skin has no scorebar, OR ships a degenerate placeholder.
+
+        draw() scales bg to 44% of the frame WIDTH and takes the bar's height
+        from bg's aspect ratio, then sizes the colour fill by colour_h / bg_h.
+        A 1x1 bg makes both ratios 1.0, so at 1920x1080 it produced
+
+          bh = int(1920 * 0.44 * 1 / 1)   = 844 px tall "bar"
+          fh = int(844 * colour_h / 1)    = a colour fill thousands of px tall
+
+        and both were composited on every frame. The placeholder is transparent,
+        so the picture shows nothing of it (a level or two of rounding where it
+        was blended), but the render ran 6 to 12 times slower.
+
+        Reporting absent matches the skin author's intent (osu!stable draws
+        nothing for a 1x1 scorebar) and costs nothing. A skin with a real
+        scorebar is unaffected."""
+        if self.bg is None:
+            return False
+        if self.bg.ndim < 2 or self.bg.shape[1] < self._MIN_BG_W:
+            return False
+        return True
 
     def draw(self, rgb, w, h, hp, blit) -> int:
         """Draw the HP bar top-left; returns its pixel height (0 if absent) so
         the caller can offset other top-left HUD below it."""
-        if self.bg is None:
+        if not self.present:
             return 0
         if self._bg_scaled is None:
             bw = int(w * 0.44)          # narrower than legacy so it clears the score
