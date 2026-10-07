@@ -26,7 +26,10 @@ def envflag(name: str, default: bool = False) -> bool:
 # R3D_TAIKO_STOCK=1 turns the whole set off at once: the stock render path, for
 # regression gates ("does stock still equal main?") and for bisecting.
 STOCK = envflag("R3D_TAIKO_STOCK")
-FAST_DEFAULT = False
+# macOS is where every one of them was built, timed and compared frame by frame
+# against the stock path. Anywhere else nothing is on until that platform has
+# been checked and this rule is widened.
+FAST_DEFAULT = sys.platform == "darwin" and not STOCK
 
 
 def _fast(name: str) -> bool:
@@ -55,7 +58,11 @@ ROUND = _fast("R3D_TAIKO_ROUND")
 MAP_READBACK = _fast("R3D_MAP_READBACK") and sys.platform == "darwin"
 SOCKET_PIPE = _fast("R3D_MAC_SOCKET_PIPE") and sys.platform == "darwin"
 RESULTS_AHEAD = _fast("R3D_TAIKO_RESULTS_AHEAD")
-GPU_YUV = _fast("R3D_TAIKO_GPU_YUV")      # asked for; gl.py checks the local ffmpeg
+# Opt-in only, like INSTANCED below: measured 5-17% SLOWER than the set above on
+# replays with breaks, because a frame inside a break still needs the CPU and
+# takes the slow road (4-7% faster on replays without). Asked for, gl.py still
+# checks the local ffmpeg.
+GPU_YUV = envflag("R3D_TAIKO_GPU_YUV") and not STOCK
 # not in the default set: one draw call per blend run. It was slower than the
 # per-sprite path on taiko's short runs, and an additive sprite's fractional
 # alpha lands one level apart as a vertex attribute (4 frames of the fixture).

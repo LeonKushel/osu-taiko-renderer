@@ -199,12 +199,16 @@ def _resolved(env: dict) -> dict:
 
 def test_a_switch_without_what_it_needs_is_off_everywhere():
     # GPU_FL=1 alone used to turn the CPU spotlight off (flashlight.py) while
-    # render.py never drew the GPU one: no flashlight at all
-    r = _resolved({"R3D_TAIKO_GPU_FL": "1", "R3D_TAIKO_GPU_NUM": "1",
+    # render.py never drew the GPU one: no flashlight at all. What each switch
+    # needs is switched OFF by hand here, so the test means the same on a
+    # platform where the set is on by default.
+    deps = ("GPU_FX", "GPU_SJ", "GPU_FL", "FL_EXACT", "GPU_NUM", "GPU_HUD", "GPU_BREAK", "MERGE_RUNS")
+    r = _resolved({"R3D_TAIKO_GPU_FX": "0", "R3D_TAIKO_GPU_FL": "1", "R3D_TAIKO_GPU_NUM": "1",
                    "R3D_TAIKO_GPU_HUD": "1", "R3D_TAIKO_GPU_BREAK": "1",
                    "R3D_TAIKO_MERGE_RUNS": "1"})
-    assert not any(r.values()), r
-    r = _resolved({"R3D_TAIKO_GPU_FX": "1", "R3D_TAIKO_GPU_BREAK": "1"})
+    assert not any(r[k] for k in deps), r
+    r = _resolved({"R3D_TAIKO_GPU_FX": "1", "R3D_TAIKO_GPU_FL": "0", "R3D_TAIKO_GPU_HUD": "0",
+                   "R3D_TAIKO_GPU_BREAK": "1"})
     assert r["GPU_FX"] and r["GPU_SJ"], r         # effects bring the skin judgements
     assert not r["FL_EXACT"] and not r["GPU_BREAK"], r
     r = _resolved({"R3D_TAIKO_GPU_FX": "1", "R3D_TAIKO_GPU_FL": "1"})
@@ -219,9 +223,14 @@ _ALL_ON = {k: "1" for k in (
 
 
 def test_nothing_is_on_unless_asked_and_stock_wins():
-    import osu_taiko_renderer.render.envflag as sw
-    if not sw.FAST_DEFAULT:
-        assert not any(_resolved({}).values()), _resolved({})
+    none = _resolved({})
+    if sys.platform != "darwin":
+        assert not any(none.values()), none            # nothing is on by default off a Mac
+    else:
+        # the Mac default: the whole set except the two opt-in switches
+        opt_in = {"INSTANCED", "GPU_YUV"}
+        assert all(v for k, v in none.items() if k not in opt_in), none
+        assert not any(none[k] for k in opt_in), none
     on = _resolved(_ALL_ON)
     mac_only = {"MAP_READBACK", "SOCKET_PIPE"}
     for k, v in on.items():
